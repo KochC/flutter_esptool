@@ -179,7 +179,12 @@ int32_t ConfigurePort(
   options.c_cflag &= static_cast<tcflag_t>(~CSIZE);
   options.c_iflag &= static_cast<tcflag_t>(~(IXON | IXOFF | IXANY));
   options.c_cflag &= static_cast<tcflag_t>(~CRTSCTS);
-  options.c_cc[VMIN] = 0;
+  options.  // VMIN=1: blocking read returns as soon as 1 byte is available.
+  // VTIME=0: no inter-character timer — rely on select()/kevent() for timeout.
+  // This avoids the macOS USB CDC/ACM race where FIONREAD says bytes are ready
+  // but O_NONBLOCK read() returns EAGAIN because the USB packet hasn't been
+  // moved into the tty buffer yet.
+  c_cc[VMIN] = 1;
   options.c_cc[VTIME] = 0;
 
   switch (data_bits) {
@@ -581,7 +586,12 @@ intptr_t serial_open_port(
     return 0;
   }
 
-  const int fd = ::open(port_name, O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
+  // Open without O_NONBLOCK so that blocking reads work correctly on USB
+  // CDC/ACM ports. On macOS, FIONREAD/kqueue report bytes ready before the
+  // USB packet lands in the tty buffer; O_NONBLOCK causes ::read() to return
+  // EAGAIN (0 bytes) even when data is available. We use select()/kevent() to
+  // wait for readability with our own timeout, then block in ::read().
+  const int fd = ::open(port_name, O_RDWR | O_NOCTTY | O_CLOEXEC);
   if (fd == -1) {
     SetErrnoError(errno, @"Unable to open the serial port");
     return 0;
