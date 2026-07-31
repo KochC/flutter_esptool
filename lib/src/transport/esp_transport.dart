@@ -4,15 +4,18 @@
 import 'dart:io';
 import 'dart:typed_data';
 
-final _dbg = File('/tmp/esp_debug.log').openWrite(mode: FileMode.append);
-void _d(String msg) { _dbg.writeln('${DateTime.now().toIso8601String()} $msg'); _dbg.flush(); }
-
 import 'package:flutter_esptool/src/models/esp_command.dart';
 import 'package:flutter_esptool/src/models/esp_config.dart';
 import 'package:flutter_esptool/src/models/esp_error.dart';
 import 'package:flutter_esptool/src/transport/esp_transport_interface.dart';
 import 'package:flutter_esptool/src/transport/slip_codec.dart';
 import 'package:platform_serial/platform_serial.dart';
+
+final _dbg = File('/tmp/esp_debug.log').openWrite(mode: FileMode.append);
+void _d(String msg) {
+  _dbg.writeln('${DateTime.now().toIso8601String()} $msg');
+  _dbg.flush();
+}
 
 /// Log event type emitted by [EspTransport].
 enum EspTransportLogType {

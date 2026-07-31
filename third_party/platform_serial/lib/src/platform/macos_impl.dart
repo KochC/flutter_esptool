@@ -6,12 +6,15 @@ import 'dart:ffi' as ffi;
 import 'dart:io';
 import 'dart:typed_data';
 
-final _dbg2 = File('/tmp/esp_debug.log').openWrite(mode: FileMode.append);
-void _dm(String msg) { _dbg2.writeln('${DateTime.now().toIso8601String()} $msg'); _dbg2.flush(); }
-
 import 'package:ffi/ffi.dart';
 
 import '../models/serial_error.dart';
+
+final _dbg2 = File('/tmp/esp_debug.log').openWrite(mode: FileMode.append);
+void _dm(String msg) {
+  _dbg2.writeln('${DateTime.now().toIso8601String()} $msg');
+  _dbg2.flush();
+}
 
 /// macOS FFI implementation for enumerating and using serial ports.
 class MacOSSerialImpl {
