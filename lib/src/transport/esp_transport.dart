@@ -68,7 +68,7 @@ typedef EspTransportLogger = void Function(EspTransportLogEntry entry);
 class EspTransport implements EspTransportInterface {
   /// Creates an [EspTransport].
   EspTransport({SerialPortInterface? serial, this.logger})
-    : serial = serial ?? SerialManager().createPort();
+      : serial = serial ?? SerialManager().createPort();
 
   /// The wrapped serial port implementation.
   final SerialPortInterface serial;
@@ -135,15 +135,34 @@ class EspTransport implements EspTransportInterface {
         await serial.setDtr(dtrState);
       }
 
-      // Classic reset (esptool ClassicReset).
-      await setDtr(false);
-      await setRts(true);
-      await Future<void>.delayed(const Duration(milliseconds: 100));
-      await setDtr(true);
-      await setRts(false);
-      await Future<void>.delayed(const Duration(milliseconds: 50));
-      await setDtr(false);
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      if (_config?.resetMode == EspResetMode.usbJtag) {
+        // USB JTAG/Serial reset (esptool USBJTAGSerialReset).
+        // Used for ESP32-S2/S3/C3/C6/H2 chips with built-in USB peripheral
+        // (Espressif VID 0x303a).  DTR/RTS have inverted polarity over USB
+        // compared to classic UART adapters.
+        await setRts(false);
+        await setDtr(false); // Idle
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+        await setDtr(true); // Set IO0 low
+        await setRts(false);
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+        await setRts(true); // EN low — reset. Go through (1,1) not (0,0).
+        await setDtr(false);
+        await setRts(true); // Propagate RTS on Windows
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+        await setDtr(false);
+        await setRts(false); // Chip out of reset, IO0 high → bootloader
+      } else {
+        // Classic reset (esptool ClassicReset).
+        await setDtr(false);
+        await setRts(true);
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+        await setDtr(true);
+        await setRts(false);
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        await setDtr(false);
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+      }
     } on SerialError catch (error) {
       if (error.type != SerialErrorType.platformUnavailable) {
         rethrow;
