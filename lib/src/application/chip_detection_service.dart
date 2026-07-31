@@ -78,6 +78,9 @@ class ChipDetectionService implements ChipDetectorInterface {
         message: 'Failed to read register 0x${address.toRadixString(16)}',
       );
     }
+    // Small inter-command delay so the ESP ROM bootloader has time to settle
+    // between back-to-back register reads before the next command is sent.
+    await Future<void>.delayed(const Duration(milliseconds: 20));
     return response.value;
   }
 

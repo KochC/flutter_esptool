@@ -35,9 +35,17 @@ class FlashService implements FlashServiceInterface {
       // The ESP ROM requires SPI_ATTACH (0x0D) before any flash write
       // commands.  Without this step the ROM does not know how the SPI flash
       // is wired and silently ignores FLASH_BEGIN.
-      await _transport.sendCommand(
+      final attachResponse = await _transport.sendCommand(
         EspCommand(opcode: EspCommandOpcode.spiAttach, data: Uint8List(8)),
       );
+      if (!attachResponse.isSuccess) {
+        return const Failure<void>(
+          EspError(
+            type: EspErrorType.flashWriteFailed,
+            message: 'The device rejected the SPI attach request',
+          ),
+        );
+      }
 
       final paddedData = FlashImageBuilder.buildPaddedImage(
         params.data,
@@ -94,6 +102,19 @@ class FlashService implements FlashServiceInterface {
         );
       }
 
+      // Debug: log the first 8 bytes of the first block so we can confirm
+      // the correct data (e.g. AA 50 for partition table) reaches the device.
+      if (dataBlocks.isNotEmpty) {
+        final first = dataBlocks[0];
+        final preview = first
+            .take(8)
+            .map((b) => b.toRadixString(16).padLeft(2, '0'))
+            .join(' ');
+        // ignore: avoid_print
+        print('[FlashService] offset=0x${params.offset.toRadixString(16)}'
+            ' first8bytes=$preview');
+      }
+
       var written = 0;
       for (var index = 0; index < blocks.length; index++) {
         final block = blocks[index];
@@ -133,6 +154,16 @@ class FlashService implements FlashServiceInterface {
       // Give the device a moment to settle after the last data block
       await Future<void>.delayed(const Duration(milliseconds: 200));
 
+      // FLASH_END / FLASH_DEFL_END data field:
+      //   0 = run user code (reboot out of download mode)
+      //   1 = stay in download mode
+      //
+      // When verify=true we need to send a flashMd5 command AFTER this, so we
+      // must stay in download mode.  When verify=false we can reboot immediately
+      // (the caller is responsible for triggering a hard reset externally).
+      // In practice, always staying in download mode (value=1) is safest —
+      // hardReset() in the transport is always called by the provider after all
+      // components are written.
       final endResponse = await _transport.sendCommand(
         EspCommand(
           opcode: params.compress
@@ -140,7 +171,8 @@ class FlashService implements FlashServiceInterface {
               : EspCommandOpcode.flashEnd,
           // ESP ROM expects checksum=0 for FLASH_END.
           checksum: 0,
-          data: _u32(0),
+          data: _u32(
+              0), // 0 = run user code after flash (ESP32-S3 ROM always reboots here)
         ),
       );
       if (!endResponse.isSuccess) {
@@ -153,13 +185,17 @@ class FlashService implements FlashServiceInterface {
       }
 
       if (params.verify) {
-        final actualResult = await md5Flash(params.offset, params.data.length);
+        // The device flash was written with a padded image (aligned to blockSize).
+        // The MD5 region on the device must cover the same padded length, and the
+        // expected hash must be computed over the same padded bytes — not the raw
+        // unpadded input — otherwise the comparison will always fail.
+        final actualResult = await md5Flash(params.offset, paddedData.length);
         if (actualResult is Failure<String>) {
           return Failure<void>(actualResult.error);
         }
-        // MD5 over the full firmware image is CPU-bound; run off the UI isolate.
-        final data = params.data;
-        final expected = await Isolate.run(() => _md5HexStatic(data));
+        // MD5 over the padded firmware image is CPU-bound; run off the UI isolate.
+        final dataToHash = paddedData;
+        final expected = await Isolate.run(() => _md5HexStatic(dataToHash));
         final actual = (actualResult as Success<String>).value.toLowerCase();
         if (expected != actual) {
           return Failure<void>(
@@ -306,7 +342,10 @@ class FlashService implements FlashServiceInterface {
       final Duration timeout;
       if (offset == null && size == null) {
         command = EspCommand(opcode: EspCommandOpcode.eraseFlash);
-        timeout = const Duration(seconds: 120);
+        // Full chip erase via stub (0xD0) can take up to ~3-4 minutes on a
+        // 16 MB flash, or ~30-60 s on a 4 MB flash. Python esptool uses
+        // CHIP_ERASE_TIMEOUT = 120 s × 3 = 360 s for the stub eraseFlash.
+        timeout = const Duration(seconds: 300);
       } else if (offset != null && size != null) {
         if (offset < 0 || size <= 0) {
           return const Failure<void>(
@@ -325,7 +364,8 @@ class FlashService implements FlashServiceInterface {
           opcode: EspCommandOpcode.eraseRegion,
           data: payload,
         );
-        final seconds = (30 * (size / (1024 * 1024))).ceil().clamp(3, 120);
+        // Allow up to 300 s for large erases (8 MB @ ~25 s/MB ≈ 200 s ROM-only).
+        final seconds = (30 * (size / (1024 * 1024))).ceil().clamp(3, 300);
         timeout = Duration(seconds: seconds);
       } else {
         return const Failure<void>(
@@ -359,14 +399,109 @@ class FlashService implements FlashServiceInterface {
   }
 
   @override
+  Future<Result<void>> eraseRegionRom({
+    required int offset,
+    required int eraseSize,
+  }) async {
+    try {
+      if (eraseSize <= 0 || eraseSize % 4096 != 0) {
+        return const Failure<void>(
+          EspError(
+            type: EspErrorType.flashEraseFailed,
+            message: 'eraseSize must be a positive multiple of 4096',
+          ),
+        );
+      }
+
+      // SPI_ATTACH is required before any flash command.
+      final attachResponse = await _transport.sendCommand(
+        EspCommand(opcode: EspCommandOpcode.spiAttach, data: Uint8List(8)),
+      );
+      if (!attachResponse.isSuccess) {
+        return const Failure<void>(
+          EspError(
+            type: EspErrorType.flashEraseFailed,
+            message: 'SPI attach failed before erase',
+          ),
+        );
+      }
+
+      // FLASH_BEGIN with num_blocks=0 and erase_size = full region.
+      // The ROM erases synchronously before returning the ACK, so the
+      // timeout must cover the full erase duration (~25 s/MB for ROM).
+      final eraseSeconds =
+          (25 * (eraseSize / (1024 * 1024))).ceil().clamp(10, 600);
+      // ignore: avoid_print
+      print(
+          '[FlashService] eraseRegionRom: offset=0x${offset.toRadixString(16)}'
+          ' eraseSize=0x${eraseSize.toRadixString(16)} timeout=${eraseSeconds}s');
+      final beginResponse = await _transport.sendCommand(
+        EspCommand(
+          opcode: EspCommandOpcode.flashBegin,
+          checksum: 0,
+          data: _buildFlashBeginPayload(
+            totalBytes: eraseSize,
+            blockCount: 0,
+            offset: offset,
+          ),
+        ),
+        timeout: Duration(seconds: eraseSeconds),
+      );
+      if (!beginResponse.isSuccess) {
+        return const Failure<void>(
+          EspError(
+            type: EspErrorType.flashEraseFailed,
+            message: 'FLASH_BEGIN erase rejected by device',
+          ),
+        );
+      }
+
+      // FLASH_END with reboot=1 (stay in download mode) so we can continue.
+      final endResponse = await _transport.sendCommand(
+        EspCommand(
+          opcode: EspCommandOpcode.flashEnd,
+          checksum: 0,
+          data: _u32(1), // 1 = stay in download mode
+        ),
+      );
+      if (!endResponse.isSuccess) {
+        return const Failure<void>(
+          EspError(
+            type: EspErrorType.flashEraseFailed,
+            message: 'FLASH_END after erase rejected by device',
+          ),
+        );
+      }
+
+      return const Success<void>(null);
+    } catch (error, stackTrace) {
+      final espError = error is EspError
+          ? error
+          : EspError(
+              type: EspErrorType.flashEraseFailed,
+              message: error.toString(),
+              stackTrace: stackTrace,
+            );
+      return Failure<void>(espError);
+    }
+  }
+
+  @override
   Future<Result<String>> md5Flash(int offset, int size) async {
     try {
       final payload = Uint8List(16);
       final data = ByteData.sublistView(payload);
       data.setUint32(0, offset, Endian.little);
       data.setUint32(4, size, Endian.little);
+      // Bytes 8-11 and 12-15 are reserved (0).  Payload is 4 × uint32 LE.
+      // Use a generous timeout: the ROM must read and hash the entire region
+      // from SPI flash without DMA.  esptool uses ~8 s/MB; we use 15 s/MB
+      // with a minimum of 10 s to be safe on slower hardware.
+      final timeoutSeconds =
+          (15 * (size / (1024 * 1024))).ceil().clamp(10, 120);
       final response = await _transport.sendCommand(
         EspCommand(opcode: EspCommandOpcode.flashMd5, data: payload),
+        timeout: Duration(seconds: timeoutSeconds),
       );
       if (!response.isSuccess) {
         return const Failure<String>(
@@ -403,20 +538,25 @@ class FlashService implements FlashServiceInterface {
     required int blockCount,
     required int offset,
   }) {
-    // Erase size must be rounded up to flash sector size (0x1000 = 4 KB).
-    // The ROM bootloader erases whole sectors; passing a sub-sector erase
-    // size causes FLASH_BEGIN to be rejected by the ESP32 ROM.
-    const flashSectorSize = 0x1000;
-    final rawEraseSize = _roundUpToBlock(totalBytes);
-    final eraseSize =
-        ((rawEraseSize + flashSectorSize - 1) ~/ flashSectorSize) *
-            flashSectorSize;
-    final payload = Uint8List(16);
+    // ESP32-S3 ROM (and all ESP32-family ROMs) compute erase_size = size
+    // directly — no sector-alignment rounding needed.  Only ESP8266 ROM uses
+    // get_erase_size with special rounding logic.
+    //
+    // ESP32-S3 ROM also requires the extended 20-byte FLASH_BEGIN format:
+    //   [0]  erase_size  (uint32 LE)
+    //   [4]  num_blocks  (uint32 LE)
+    //   [8]  block_size  (uint32 LE)
+    //   [12] offset      (uint32 LE)
+    //   [16] encrypted   (uint32 LE, 0 = not encrypted)
+    // Sending only 16 bytes causes the ROM to reject subsequent FLASH_DATA
+    // packets with ROM_INVALID_RECV_MSG (status=1, error=5).
+    final payload = Uint8List(20);
     final data = ByteData.sublistView(payload);
-    data.setUint32(0, eraseSize, Endian.little);
+    data.setUint32(0, totalBytes, Endian.little);
     data.setUint32(4, blockCount, Endian.little);
     data.setUint32(8, blockSize, Endian.little);
     data.setUint32(12, offset, Endian.little);
+    data.setUint32(16, 0, Endian.little); // encrypted = 0
     return payload;
   }
 

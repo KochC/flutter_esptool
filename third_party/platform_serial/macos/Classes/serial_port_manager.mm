@@ -179,12 +179,12 @@ int32_t ConfigurePort(
   options.c_cflag &= static_cast<tcflag_t>(~CSIZE);
   options.c_iflag &= static_cast<tcflag_t>(~(IXON | IXOFF | IXANY));
   options.c_cflag &= static_cast<tcflag_t>(~CRTSCTS);
-  options.  // VMIN=1: blocking read returns as soon as 1 byte is available.
+  // VMIN=1: blocking read returns as soon as 1 byte is available.
   // VTIME=0: no inter-character timer — rely on select()/kevent() for timeout.
   // This avoids the macOS USB CDC/ACM race where FIONREAD says bytes are ready
   // but O_NONBLOCK read() returns EAGAIN because the USB packet hasn't been
   // moved into the tty buffer yet.
-  c_cc[VMIN] = 1;
+  options.c_cc[VMIN] = 1;
   options.c_cc[VTIME] = 0;
 
   switch (data_bits) {
@@ -659,8 +659,23 @@ int32_t serial_read(intptr_t handle_value, uint8_t *buffer, int32_t length, int3
   }
 
   const int32_t ready = WaitReadable(handle, timeout_ms);
-  if (ready <= 0) {
-    return ready;
+  if (ready < 0) {
+    return ready; // error
+  }
+  // ready == 0 means WaitReadable timed out.  On macOS USB CDC/ACM, FIONREAD
+  // may report bytes available while kqueue reports no event (because the
+  // edge-triggered EV_CLEAR event was already consumed by a prior kevent call).
+  // Fall through to ::read() in both cases; if there really is no data, ::read()
+  // with VMIN=1 will block briefly but the Dart poll loop will have already
+  // confirmed FIONREAD > 0 before invoking us.  Use a 0-length short-circuit
+  // check so we don't block forever when timeout_ms==0 and FIONREAD==0.
+  if (ready == 0) {
+    // Check FIONREAD: if the kernel says there are no bytes, respect the timeout.
+    int fionread_count = 0;
+    if (ioctl(handle->fd, FIONREAD, &fionread_count) == 0 && fionread_count == 0) {
+      return 0; // truly nothing yet
+    }
+    // FIONREAD says bytes are waiting — fall through to ::read().
   }
 
   while (true) {
@@ -748,6 +763,52 @@ char *serial_copy_last_error_message(void) {
 
   memcpy(message, g_last_error_message.c_str(), g_last_error_message.size() + 1);
   return message;
+}
+
+int32_t serial_set_dtr(intptr_t handle_value, int32_t enabled) {
+  auto *handle = HandleFromOpaque(handle_value);
+  if (handle == nullptr) {
+    return SetErrnoError(EINVAL, @"Invalid serial-port handle");
+  }
+
+  int status = 0;
+  if (ioctl(handle->fd, TIOCMGET, &status) != 0) {
+    return SetErrnoError(errno, @"Unable to get modem control signals");
+  }
+
+  if (enabled) {
+    status |= TIOCM_DTR;
+  } else {
+    status &= ~TIOCM_DTR;
+  }
+
+  if (ioctl(handle->fd, TIOCMSET, &status) != 0) {
+    return SetErrnoError(errno, @"Unable to set DTR signal");
+  }
+  return 0;
+}
+
+int32_t serial_set_rts(intptr_t handle_value, int32_t enabled) {
+  auto *handle = HandleFromOpaque(handle_value);
+  if (handle == nullptr) {
+    return SetErrnoError(EINVAL, @"Invalid serial-port handle");
+  }
+
+  int status = 0;
+  if (ioctl(handle->fd, TIOCMGET, &status) != 0) {
+    return SetErrnoError(errno, @"Unable to get modem control signals");
+  }
+
+  if (enabled) {
+    status |= TIOCM_RTS;
+  } else {
+    status &= ~TIOCM_RTS;
+  }
+
+  if (ioctl(handle->fd, TIOCMSET, &status) != 0) {
+    return SetErrnoError(errno, @"Unable to set RTS signal");
+  }
+  return 0;
 }
 
 void serial_free_memory(void *memory) { free(memory); }

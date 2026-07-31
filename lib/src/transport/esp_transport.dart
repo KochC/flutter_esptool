@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Piergiorgio Vagnozzi
 // Licensed under the MIT License.
 
-import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter_esptool/src/models/esp_command.dart';
@@ -10,11 +9,11 @@ import 'package:flutter_esptool/src/models/esp_error.dart';
 import 'package:flutter_esptool/src/transport/esp_transport_interface.dart';
 import 'package:flutter_esptool/src/transport/slip_codec.dart';
 import 'package:platform_serial/platform_serial.dart';
+import 'package:platform_serial/src/direct_serial_port.dart';
 
-final _dbg = File('/tmp/esp_debug.log').openWrite(mode: FileMode.append);
 void _d(String msg) {
-  _dbg.writeln('${DateTime.now().toIso8601String()} $msg');
-  _dbg.flush();
+  // ignore: avoid_print
+  print('${DateTime.now().toIso8601String()} $msg');
 }
 
 /// Log event type emitted by [EspTransport].
@@ -74,8 +73,14 @@ typedef EspTransportLogger = void Function(EspTransportLogEntry entry);
 /// Serial transport implementation for the ESP SLIP protocol.
 class EspTransport implements EspTransportInterface {
   /// Creates an [EspTransport].
+  ///
+  /// Uses [DirectSerialPort] by default instead of [SerialPort].  [SerialPort]
+  /// starts a 40 ms background polling timer that races against explicit
+  /// [serial.read] calls and steals bytes from the SLIP framing loop.
+  /// [DirectSerialPort] has no background stream, so all reads go directly to
+  /// the platform layer.
   EspTransport({SerialPortInterface? serial, this.logger})
-      : serial = serial ?? SerialManager().createPort();
+      : serial = serial ?? DirectSerialPort();
 
   /// The wrapped serial port implementation.
   final SerialPortInterface serial;
@@ -165,14 +170,14 @@ class EspTransport implements EspTransportInterface {
         await setRts(false); // Chip out of reset, IO0 high → bootloader
 
         // The USB device disconnects during reset and re-enumerates as a
-        // bootloader. Close the port, wait for re-enumeration, then reopen.
+        // bootloader. Close the port, wait for re-enumeration, then reopen
+        // with retries — the port may not be available immediately.
         final config = _config!;
         _d('[ESP] USB JTAG: closing port for re-enum');
         await serial.close();
-        _d('[ESP] USB JTAG: waiting 500ms for re-enum');
-        await Future<void>.delayed(const Duration(milliseconds: 500));
-        _d('[ESP] USB JTAG: reopening port ${config.portName}');
-        await serial.open(SerialConfig(
+        _d('[ESP] USB JTAG: waiting 1500ms for re-enum');
+        await Future<void>.delayed(const Duration(milliseconds: 1500));
+        final serialConfig = SerialConfig(
           portName: config.portName,
           baudRate: config.initialBaudRate,
           dataBits: 8,
@@ -181,10 +186,35 @@ class EspTransport implements EspTransportInterface {
           flowControl: SerialFlowControl.none,
           readTimeout: config.timeout,
           writeTimeout: config.timeout,
-        ));
+        );
+        SerialError? lastError;
+        for (var attempt = 0; attempt < 10; attempt++) {
+          try {
+            _d('[ESP] USB JTAG: reopening port ${config.portName} attempt=${attempt + 1}');
+            await serial.open(serialConfig);
+            lastError = null;
+            break;
+          } on SerialError catch (e) {
+            lastError = e;
+            _d('[ESP] USB JTAG: reopen failed (${e.message}), retrying...');
+            await Future<void>.delayed(const Duration(milliseconds: 200));
+          }
+        }
+        if (lastError != null) {
+          throw lastError;
+        }
+        // Flush both the hardware RX buffer (which may contain ROM banner bytes
+        // that accumulated during the 1500 ms re-enumeration wait) and the
+        // in-memory read buffer.  Without this, stale ROM banner bytes remain
+        // in the kernel buffer and contaminate subsequent SLIP frame reads.
+        try {
+          await serial.resetBuffers();
+        } on SerialError {
+          // Best-effort: ignore if the driver does not support it.
+        }
         _readBuffer.clear();
         _d('[ESP] USB JTAG: port reopened OK');
-        return; // buffers already fresh — skip the flush/resetBuffers below
+        return; // buffers flushed — skip the generic flush/resetBuffers below
       } else {
         // Classic reset (esptool ClassicReset).
         await setDtr(false);
@@ -280,6 +310,20 @@ class EspTransport implements EspTransportInterface {
         try {
           response = _parseResponse(responseFrame.packet);
         } on EspError catch (parseError) {
+          // A ROM-rejection error (opcode=0x00 response) is a definitive
+          // failure — re-raise it immediately rather than treating as noise.
+          if (parseError.message.startsWith('ROM bootloader rejected')) {
+            _d('[ESP] ROM rejected command ${command.opcode}: ${parseError.message}');
+            rethrow;
+          }
+          // A short frame that does not look like an ESP response may be the
+          // stub OHAI greeting (c0 4f 48 41 49 c0).  Push the raw frame back
+          // into _readBuffer so that a subsequent readRaw() call can retrieve
+          // it — this is critical for stub OHAI detection.
+          _d('[ESP] Noise frame (${responseFrame.packet.length}B), pushing raw '
+              'frame back to buffer: '
+              '${responseFrame.rawFrame.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ')}');
+          _readBuffer.add(responseFrame.rawFrame);
           logger?.call(
             EspTransportLogEntry(
               type: EspTransportLogType.transportError,
@@ -288,7 +332,8 @@ class EspTransport implements EspTransportInterface {
               rawPacket: Uint8List.fromList(responseFrame.packet),
               rawFrame: Uint8List.fromList(responseFrame.rawFrame),
               command: command,
-              message: 'Noise frame skipped: ${parseError.message}',
+              message:
+                  'Noise frame pushed back to buffer: ${parseError.message}',
             ),
           );
           continue;
@@ -308,7 +353,11 @@ class EspTransport implements EspTransportInterface {
 
         // ESP ROM can return stale/extra packets (for example extra SYNC replies).
         // Keep reading until the response opcode matches the in-flight command.
+        _d('[ESP] frame opcode=${response.opcode} want=${command.opcode} '
+            'value=0x${response.value.toRadixString(16)} '
+            'status=${response.status} error=${response.error}');
         if (response.opcode == command.opcode) {
+          _d('[ESP] opcode matched — returning response');
           return response;
         }
       }
@@ -329,6 +378,189 @@ class EspTransport implements EspTransportInterface {
       );
       rethrow;
     }
+  }
+
+  @override
+  Future<List<int>> readRaw(int count, {Duration? timeout}) async {
+    final effectiveTimeout =
+        timeout ?? _config?.timeout ?? const Duration(seconds: 5);
+    final deadline = DateTime.now().add(effectiveTimeout);
+    final result = <int>[];
+
+    // Drain any bytes already sitting in the in-memory read buffer first.
+    if (_readBuffer.length > 0) {
+      final buffered = _readBuffer.toBytes();
+      _readBuffer.clear();
+      result.addAll(buffered.take(count));
+      if (result.length >= count) {
+        return result.sublist(0, count);
+      }
+    }
+
+    while (result.length < count && DateTime.now().isBefore(deadline)) {
+      final remaining = deadline.difference(DateTime.now());
+      if (remaining <= Duration.zero) break;
+      try {
+        final need = count - result.length;
+        final available = await serial.bytesAvailable();
+        final toRead = available > 0 ? available.clamp(1, need) : 1;
+        _d('[ESP] readRaw: FIONREAD=$available toRead=$toRead'
+            ' remaining=${remaining.inMilliseconds}ms');
+        final chunk = await serial.read(toRead, timeout: remaining);
+        _d('[ESP] readRaw: got ${chunk.length} bytes');
+        if (chunk.isNotEmpty) {
+          result.addAll(chunk.take(need));
+        } else {
+          // No data yet — yield to the event loop to avoid a tight spin.
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        }
+      } on SerialError catch (e) {
+        if (e.type != SerialErrorType.timeout) {
+          throw _mapSerialError(e, StackTrace.current);
+        }
+        await Future<void>.delayed(Duration.zero);
+      }
+    }
+
+    return result;
+  }
+
+  @override
+  Future<void> flushRx() async {
+    _readBuffer.clear();
+    try {
+      await serial.resetBuffers();
+    } on SerialError {
+      // Best-effort.
+    }
+  }
+
+  @override
+  Future<void> writeRaw(List<int> bytes, {Duration? timeout}) async {
+    final effectiveTimeout =
+        timeout ?? _config?.timeout ?? const Duration(seconds: 5);
+    try {
+      await serial.write(
+        Uint8List.fromList(bytes),
+        timeout: effectiveTimeout,
+      );
+    } on SerialError catch (error, stackTrace) {
+      throw _mapSerialError(error, stackTrace);
+    }
+  }
+
+  @override
+  Future<void> reopenPort({
+    Duration waitBefore = const Duration(milliseconds: 1500),
+  }) async {
+    final config = _config;
+    if (config == null) {
+      _d('[ESP] reopenPort: no config — skipping');
+      return;
+    }
+    _d('[ESP] reopenPort: closing port for stub USB re-enum');
+    if (serial.isOpen) {
+      try {
+        await serial.close();
+      } on SerialError {
+        // Best-effort close.
+      }
+    }
+    _readBuffer.clear();
+    _d('[ESP] reopenPort: waiting ${waitBefore.inMilliseconds}ms for re-enum');
+    await Future<void>.delayed(waitBefore);
+
+    final serialConfig = SerialConfig(
+      portName: config.portName,
+      baudRate: config.initialBaudRate,
+      dataBits: 8,
+      stopBits: SerialStopBits.one,
+      parity: SerialParity.none,
+      flowControl: SerialFlowControl.none,
+      readTimeout: config.timeout,
+      writeTimeout: config.timeout,
+    );
+    SerialError? lastError;
+    for (var attempt = 0; attempt < 10; attempt++) {
+      try {
+        _d('[ESP] reopenPort: reopening ${config.portName} attempt=${attempt + 1}');
+        await serial.open(serialConfig);
+        lastError = null;
+        break;
+      } on SerialError catch (e) {
+        lastError = e;
+        _d('[ESP] reopenPort: reopen failed (${e.message}), retrying...');
+        await Future<void>.delayed(const Duration(milliseconds: 200));
+      }
+    }
+    if (lastError != null) {
+      throw _mapSerialError(lastError, StackTrace.current);
+    }
+    try {
+      await serial.resetBuffers();
+    } on SerialError {
+      // Best-effort.
+    }
+    _readBuffer.clear();
+    _d('[ESP] reopenPort: port reopened OK');
+  }
+
+  @override
+  Future<void> hardReset() async {
+    // The ESP32-S3 ROM always reboots after FLASH_END regardless of the
+    // reboot flag, so by the time hardReset() is called the device is already
+    // running user code and the ROM bootloader is no longer listening.
+    // We therefore skip the writeReg round-trip entirely (it would time out)
+    // and just pulse RTS to drive the EN line, which re-enters the app.
+    // If the port is already closed (device re-enumerated), reopen it briefly
+    // just to drive the RTS pin, then close again.
+    _d('[ESP] hardReset: pulsing RTS (EN line) LOW then HIGH');
+
+    final needsOpen = !serial.isOpen;
+    if (needsOpen) {
+      final config = _config;
+      if (config == null) {
+        // No config — cannot reopen. Just return; device already rebooted.
+        _d('[ESP] hardReset: no config, skipping RTS pulse');
+        return;
+      }
+      try {
+        final serialConfig = SerialConfig(
+          portName: config.portName,
+          baudRate: config.initialBaudRate,
+          dataBits: 8,
+          stopBits: SerialStopBits.one,
+          parity: SerialParity.none,
+          flowControl: SerialFlowControl.none,
+          readTimeout: const Duration(seconds: 1),
+          writeTimeout: const Duration(seconds: 1),
+        );
+        await serial.open(serialConfig);
+      } on SerialError {
+        // Port not yet available after re-enum — device already booted, skip.
+        _d('[ESP] hardReset: port unavailable, skipping RTS pulse');
+        return;
+      }
+    }
+
+    try {
+      // Release IO0 (BOOT pin) first so the chip boots to user code, not
+      // download mode.  On ESP32-S3 USB-JTAG, DTR drives IO0: DTR=false →
+      // IO0=high → normal boot.  Without this the chip re-enters DOWNLOAD
+      // mode after the EN reset even though FLASH_END was sent with data=0.
+      await serial.setDtr(false); // IO0 = HIGH → normal boot
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      await serial.setRts(true); // EN = LOW → chip in reset
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      await serial.setRts(false); // EN = HIGH → chip boots user code
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    } on SerialError catch (error, stackTrace) {
+      if (needsOpen) await serial.close();
+      throw _mapSerialError(error, stackTrace);
+    }
+
+    if (needsOpen) await serial.close();
+    _d('[ESP] hardReset: done');
   }
 
   @override
@@ -422,9 +654,15 @@ class EspTransport implements EspTransportInterface {
     }
 
     final trailing = _readBuffer.toBytes();
-    _readBuffer.clear();
     if (trailing.isNotEmpty) {
-      _d('[ESP] partialPacket: ${trailing.length} bytes in buffer: '
+      // Do NOT clear _readBuffer here.  Any bytes that accumulated (e.g. the
+      // stub OHAI greeting that arrives immediately after MEM_END) must survive
+      // the timeout so that a subsequent readRaw() call can retrieve them.
+      // The next sendCommand / _tryExtractFrame call will see them again; if
+      // they are not a valid ESP response they will be pushed back (see the
+      // noise-frame handler in sendCommand), and readRaw() will drain them.
+      _d('[ESP] partialPacket: ${trailing.length} bytes remain in buffer '
+          '(preserved for readRaw): '
           '${trailing.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ')}');
       throw const EspError(
         type: EspErrorType.partialPacket,
@@ -445,18 +683,68 @@ class EspTransport implements EspTransportInterface {
       return null;
     }
 
-    // Skip leading 0xC0 flush bytes that some ROM/stub implementations emit
-    // before each frame.  Standard SLIP uses a single 0xC0 as start delimiter
-    // but the ESP ROM may prepend an extra 0xC0 as a buffer-flush indicator.
-    // We advance `start` past any consecutive 0xC0 bytes so that we treat the
-    // LAST of the cluster as the real opening delimiter.
-    var start = current.indexOf(0xC0);
-    if (start < 0) {
-      _readBuffer.clear();
+    // -----------------------------------------------------------------------
+    // SLIP framing note
+    // -----------------------------------------------------------------------
+    // In ESP's SLIP dialect the 0xC0 byte acts as BOTH a frame-end AND a
+    // frame-start delimiter.  The END of one frame is the START of the next,
+    // so a response may legitimately arrive WITHOUT a leading 0xC0 — the ROM
+    // or stub simply omits the redundant open delimiter when the previous
+    // frame's trailing 0xC0 already serves as the boundary.
+    //
+    // Strategy:
+    //   1. Look for a leading cluster of 0xC0 bytes (normal "framed" case):
+    //      advance `start` to the LAST of any consecutive 0xC0s so that we
+    //      treat only the final one as the opening delimiter.
+    //   2. If no leading 0xC0 exists but there IS a 0xC0 somewhere in the
+    //      buffer, treat index 0 as the implicit start and the first 0xC0 as
+    //      the closing delimiter (stub "frameless-start" case).
+    // -----------------------------------------------------------------------
+
+    var start = 0;
+    final firstC0 = current.indexOf(0xC0);
+
+    if (firstC0 < 0) {
+      // No 0xC0 anywhere — not even a partial frame yet; wait for more data.
       return null;
     }
-    while (start + 1 < current.length && current[start + 1] == 0xC0) {
-      start++;
+
+    if (current[0] == 0xC0) {
+      // Normal case: buffer starts with (possibly multiple) 0xC0 delimiter(s).
+      // Advance `start` to the LAST of the consecutive leading 0xC0 bytes.
+      start = 0;
+      while (start + 1 < current.length && current[start + 1] == 0xC0) {
+        start++;
+      }
+    } else {
+      // Frameless-start case: the stub omitted the opening 0xC0 (the previous
+      // frame's trailing 0xC0 was already consumed).  Treat byte 0 as the
+      // implicit start; the first 0xC0 in the buffer is the closing delimiter.
+      //
+      // Build a synthetic SLIP frame by prepending a 0xC0.
+      final closingC0 = firstC0;
+      final syntheticRaw = Uint8List(1 + closingC0 + 1);
+      syntheticRaw[0] = 0xC0; // synthetic opening delimiter
+      syntheticRaw.setRange(1, 1 + closingC0, current, 0);
+      syntheticRaw[1 + closingC0] = 0xC0; // real closing delimiter
+      final frame = SlipCodec.decode(syntheticRaw);
+      final remaining = Uint8List.fromList(current.sublist(closingC0 + 1));
+      _d('[ESP] _tryExtractFrame: frameless-start: closingC0=$closingC0'
+          ' decodedLen=${frame?.length ?? -1}');
+      _readBuffer.clear();
+      if (remaining.isNotEmpty) {
+        _readBuffer.add(remaining);
+      }
+      if (frame == null) {
+        throw const EspError(
+          type: EspErrorType.invalidResponse,
+          message: 'Received an invalid SLIP frame (frameless-start)',
+        );
+      }
+      if (frame.isEmpty) {
+        return _tryExtractFrame();
+      }
+      return _FrameReadResult(rawFrame: syntheticRaw, packet: frame);
     }
 
     for (var index = start + 1; index < current.length; index++) {
@@ -467,6 +755,8 @@ class EspTransport implements EspTransportInterface {
       final rawFrame = Uint8List.fromList(current.sublist(start, index + 1));
       final frame = SlipCodec.decode(rawFrame);
       final remaining = Uint8List.fromList(current.sublist(index + 1));
+      _d('[ESP] _tryExtractFrame: found frame [$start..$index]'
+          ' rawLen=${rawFrame.length} decodedLen=${frame?.length ?? -1}');
       _readBuffer.clear();
       if (remaining.isNotEmpty) {
         _readBuffer.add(remaining);
@@ -486,10 +776,8 @@ class EspTransport implements EspTransportInterface {
       return _FrameReadResult(rawFrame: rawFrame, packet: frame);
     }
 
-    if (start > 0) {
-      _readBuffer.clear();
-      _readBuffer.add(current.sublist(start));
-    }
+    // No closing 0xC0 found yet — buffer holds an incomplete frame.
+    // Do NOT discard bytes; just return null so the caller reads more data.
     return null;
   }
 
@@ -510,8 +798,23 @@ class EspTransport implements EspTransportInterface {
     }
 
     final opcodeValue = data.getUint8(1);
-    final opcode = EspCommandOpcodeParsing.fromValue(opcodeValue);
+    var opcode = EspCommandOpcodeParsing.fromValue(opcodeValue);
     if (opcode == null) {
+      // The ROM bootloader sends opcode=0x00 for unsupported/unknown commands
+      // (e.g. eraseFlash 0xD0 which is stub-only).  Rather than discarding the
+      // error response as noise, remap opcode=0 to the caller's command opcode
+      // so sendCommand can fail fast instead of waiting for the full timeout.
+      if (opcodeValue == 0x00) {
+        // The ROM bootloader sends opcode=0x00 for unsupported commands.
+        // payload starts at byte 8; status=payload[0], error=payload[1].
+        final statusByte = frame.length >= 10 ? frame[8] : 1;
+        final errorByte = frame.length >= 11 ? frame[9] : 0;
+        throw EspError(
+          type: EspErrorType.invalidResponse,
+          message:
+              'ROM bootloader rejected command (status=$statusByte error=$errorByte)',
+        );
+      }
       throw EspError(
         type: EspErrorType.invalidResponse,
         message:

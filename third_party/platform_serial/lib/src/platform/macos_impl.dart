@@ -10,10 +10,9 @@ import 'package:ffi/ffi.dart';
 
 import '../models/serial_error.dart';
 
-final _dbg2 = File('/tmp/esp_debug.log').openWrite(mode: FileMode.append);
 void _dm(String msg) {
-  _dbg2.writeln('${DateTime.now().toIso8601String()} $msg');
-  _dbg2.flush();
+  // ignore: avoid_print
+  print('${DateTime.now().toIso8601String()} $msg');
 }
 
 /// macOS FFI implementation for enumerating and using serial ports.
@@ -161,26 +160,36 @@ class MacOSSerialImpl {
       }
 
       if (available > 0) {
-        // Data is ready — pass the remaining deadline as the native timeout.
-        // The native read() is now blocking (no O_NONBLOCK, VMIN=1) so it will
-        // wait up to timeout_ms for at least 1 byte to arrive in the tty buffer.
-        final remainingMs =
-            (deadlineMs - DateTime.now().millisecondsSinceEpoch).clamp(1, 5000);
-        final readLength = available < length ? available : length;
+        // FIONREAD says bytes are ready.  Pass a short timeout (50 ms) to the
+        // native read so that WaitReadable inside serial_read does not block the
+        // Dart isolate for the full remaining deadline.  The outer Dart loop
+        // retries until the outer deadline expires, so a short native timeout is
+        // fine.  The FIONREAD-fallback inside serial_read also ensures ::read()
+        // is attempted even when kqueue's edge event was already consumed.
+        //
+        // IMPORTANT: read ALL available bytes, not just `length`.  The kqueue
+        // filter is EV_CLEAR (edge-triggered): once the event fires and is
+        // consumed, it will NOT re-fire for bytes already sitting in the OS
+        // buffer.  If we read fewer bytes than FIONREAD reports, the remaining
+        // bytes stay in the kernel buffer but kqueue never wakes us again for
+        // them — causing a hang.  Reading greedily is always safe for SLIP
+        // framing because the caller accumulates bytes in _readBuffer and
+        // extracts complete frames.
+        const int nativeTimeoutMs = 50;
+        final readLength = available;
         final buffer = calloc<ffi.Uint8>(readLength);
         try {
           final bytesRead =
-              _bindings.read(handle, buffer, readLength, remainingMs);
-          print(
-              '[MAC] native read: requested=$readLength got=$bytesRead available=$available');
+              _bindings.read(handle, buffer, readLength, nativeTimeoutMs);
+          _dm('[MAC] native read: requested=$readLength got=$bytesRead available=$available');
           if (bytesRead < 0) throw _lastError('Error reading on macOS');
           if (bytesRead == 0) {
-            // Timed out inside native read — treat as no data yet.
+            // Timed out inside native read — yield and retry.
+            await Future<void>.delayed(const Duration(milliseconds: 1));
             continue;
           }
           final result = Uint8List.fromList(buffer.asTypedList(bytesRead));
-          print(
-              '[MAC] native bytes: ${result.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ')}');
+          _dm('[MAC] native bytes: ${result.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ')}');
           return result;
         } finally {
           calloc.free(buffer);
@@ -269,6 +278,24 @@ class MacOSSerialImpl {
       throw _lastError('Error retrieving available bytes on macOS');
     }
     return available;
+  }
+
+  /// Sets the DTR (Data Terminal Ready) control signal.
+  static Future<void> setDtr(String portName, bool enabled) async {
+    final state = _requirePort(portName);
+    final status = _bindings.setDtr(state.handle, enabled ? 1 : 0);
+    if (status < 0) {
+      throw _lastError('Error setting DTR on macOS port $portName');
+    }
+  }
+
+  /// Sets the RTS (Request To Send) control signal.
+  static Future<void> setRts(String portName, bool enabled) async {
+    final state = _requirePort(portName);
+    final status = _bindings.setRts(state.handle, enabled ? 1 : 0);
+    if (status < 0) {
+      throw _lastError('Error setting RTS on macOS port $portName');
+    }
   }
 
   /// Resets the input and output buffers of the port.
@@ -380,6 +407,7 @@ typedef _WriteNative = ffi.Int32 Function(
 );
 typedef _HandleOnlyNative = ffi.Int32 Function(ffi.IntPtr);
 typedef _WaitReadableNative = ffi.Int32 Function(ffi.IntPtr, ffi.Int32);
+typedef _SetControlSignalNative = ffi.Int32 Function(ffi.IntPtr, ffi.Int32);
 typedef _GetLastErrorCodeNative = ffi.Int32 Function();
 typedef _CopyLastErrorMessageNative = ffi.Pointer<Utf8> Function();
 typedef _FreeMemoryNative = ffi.Void Function(ffi.Pointer<ffi.Void>);
@@ -412,6 +440,10 @@ class _MacOSSerialBindings {
             library.lookupFunction<_WaitReadableNative, int Function(int, int)>(
           'serial_wait_readable',
         ),
+        setDtr = library.lookupFunction<_SetControlSignalNative,
+            int Function(int, int)>('serial_set_dtr'),
+        setRts = library.lookupFunction<_SetControlSignalNative,
+            int Function(int, int)>('serial_set_rts'),
         flush = library.lookupFunction<_HandleOnlyNative, int Function(int)>(
           'serial_flush',
         ),
@@ -437,6 +469,8 @@ class _MacOSSerialBindings {
   final int Function(int, ffi.Pointer<ffi.Uint8>, int, int) write;
   final int Function(int) bytesAvailable;
   final int Function(int, int) waitReadable;
+  final int Function(int, int) setDtr;
+  final int Function(int, int) setRts;
   final int Function(int) flush;
   final int Function(int) resetBuffers;
   final int Function() getLastErrorCode;

@@ -18,10 +18,10 @@ enum EspCommandOpcode {
   memBegin(0x05),
 
   /// Finalises a RAM write sequence.
-  memEnd(0x07),
+  memEnd(0x06),
 
   /// Sends a RAM data block.
-  memData(0x06),
+  memData(0x07),
 
   /// Synchronises with the ROM bootloader.
   sync(0x08),
