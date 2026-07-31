@@ -160,9 +160,14 @@ class MacOSSerialImpl {
         final buffer = calloc<ffi.Uint8>(readLength);
         try {
           final bytesRead = _bindings.read(handle, buffer, readLength, 0);
+          print(
+              '[MAC] native read: requested=$readLength got=$bytesRead available=$available');
           if (bytesRead < 0) throw _lastError('Error reading on macOS');
           if (bytesRead == 0) return Uint8List(0);
-          return Uint8List.fromList(buffer.asTypedList(bytesRead));
+          final result = Uint8List.fromList(buffer.asTypedList(bytesRead));
+          print(
+              '[MAC] native bytes: ${result.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ')}');
+          return result;
         } finally {
           calloc.free(buffer);
         }
