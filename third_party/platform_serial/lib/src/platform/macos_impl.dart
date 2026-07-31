@@ -124,7 +124,10 @@ class MacOSSerialImpl {
     }
   }
 
-  /// Reads up to [length] bytes from the port, waiting up to [readTimeoutMs].
+  /// Reads up to [length] bytes from the port.
+  ///
+  /// [timeoutMs] overrides the port's configured read timeout for this call.
+  /// If omitted, the port's configured [_MacOSPortState.readTimeoutMs] is used.
   ///
   /// Instead of passing the full timeout to the blocking C `read()` call
   /// (which would stall the Dart isolate for the entire duration), this method
@@ -132,13 +135,17 @@ class MacOSSerialImpl {
   /// `read()` when data is actually present — using timeout=0 so the C call
   /// returns immediately.  Between polls it yields via [Future.delayed] so
   /// the Flutter UI isolate stays fully responsive.
-  static Future<Uint8List> readData(String portName, int length) async {
+  static Future<Uint8List> readData(
+    String portName,
+    int length, {
+    int? timeoutMs,
+  }) async {
     final state = _requirePort(portName);
     if (length <= 0) return Uint8List(0);
 
     final handle = state.handle;
-    final deadlineMs =
-        DateTime.now().millisecondsSinceEpoch + state.readTimeoutMs;
+    final deadlineMs = DateTime.now().millisecondsSinceEpoch +
+        (timeoutMs ?? state.readTimeoutMs);
 
     while (true) {
       // Check how many bytes are available without blocking.
@@ -171,23 +178,58 @@ class MacOSSerialImpl {
     }
   }
 
-  /// Writes data to the port using the natively configured timeout.
-  static Future<int> writeData(String portName, Uint8List data) async {
+  /// Writes [data] to the port without blocking the Dart isolate.
+  ///
+  /// Instead of passing the full write timeout to the blocking C `write()`
+  /// call, this method calls `write()` with `timeout=0` (non-blocking) in an
+  /// async loop, yielding via [Future.delayed] between attempts so the Flutter
+  /// UI isolate stays responsive.  On a serial port the kernel output buffer
+  /// is essentially always writable for small packets so the first call
+  /// typically writes all bytes immediately.
+  static Future<int> writeData(
+    String portName,
+    Uint8List data, {
+    int? timeoutMs,
+  }) async {
+    if (data.isEmpty) return 0;
     final state = _requirePort(portName);
-    final pointer = calloc<ffi.Uint8>(data.isEmpty ? 1 : data.length);
+    final handle = state.handle;
+    final effectiveTimeoutMs = timeoutMs ?? state.writeTimeoutMs;
+    final deadlineMs =
+        DateTime.now().millisecondsSinceEpoch + effectiveTimeoutMs;
 
+    final pointer = calloc<ffi.Uint8>(data.length);
     try {
       pointer.asTypedList(data.length).setAll(0, data);
-      final bytesWritten = _bindings.write(
-        state.handle,
-        pointer,
-        data.length,
-        state.writeTimeoutMs,
-      );
-      if (bytesWritten < 0) {
-        throw _lastError('Error writing on macOS');
+      var totalWritten = 0;
+
+      while (totalWritten < data.length) {
+        // Non-blocking write attempt (timeout=0): returns immediately if the
+        // kernel output buffer is not ready, or writes as many bytes as fit.
+        final bytesWritten = _bindings.write(
+          handle,
+          ffi.Pointer<ffi.Uint8>.fromAddress(
+            pointer.address + totalWritten,
+          ),
+          data.length - totalWritten,
+          0, // timeout=0 → non-blocking
+        );
+
+        if (bytesWritten < 0) {
+          throw _lastError('Error writing on macOS');
+        }
+        totalWritten += bytesWritten;
+
+        if (totalWritten >= data.length) break;
+
+        // Output buffer not ready yet — check deadline then yield.
+        if (DateTime.now().millisecondsSinceEpoch >= deadlineMs) {
+          throw _lastError('Write timeout on macOS');
+        }
+        await Future<void>.delayed(const Duration(milliseconds: 1));
       }
-      return bytesWritten;
+
+      return totalWritten;
     } finally {
       calloc.free(pointer);
     }
