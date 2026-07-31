@@ -135,7 +135,10 @@ class EspTransport implements EspTransportInterface {
         await serial.setDtr(dtrState);
       }
 
-      if (_config?.resetMode == EspResetMode.usbJtag) {
+      if (_config?.resetMode == EspResetMode.none) {
+        // No reset — device is assumed to already be in bootloader mode.
+        // Just flush buffers below and return.
+      } else if (_config?.resetMode == EspResetMode.usbJtag) {
         // USB JTAG/Serial reset (esptool USBJTAGSerialReset).
         // Used for ESP32-S2/S3/C3/C6/H2 chips with built-in USB peripheral
         // (Espressif VID 0x303a).  DTR/RTS have inverted polarity over USB

@@ -10,6 +10,11 @@ enum EspResetMode {
   /// C3, C6, H2).  DTR/RTS lines are toggled in a specific pattern that the
   /// USB Serial/JTAG peripheral interprets as a bootloader-entry request.
   usbJtag,
+
+  /// Skip the hardware reset entirely — assume the chip is already in ROM
+  /// bootloader mode.  Use this for ESP32-S3 USB JTAG devices that are
+  /// already awaiting SYNC (e.g. freshly powered or manually held in boot).
+  none,
 }
 
 /// Configuration for an ESP serial session.

@@ -28,8 +28,9 @@ class ConnectionService {
       final syncTimeout = config.timeout;
 
       for (var attempt = 0; attempt < config.syncRetries; attempt++) {
-        // Always reset to bootloader — on attempt 0 this puts the chip into
-        // ROM mode; on retries it recovers from a stuck/partial state.
+        // Reset to bootloader before each attempt.
+        // EspResetMode.none is a no-op in resetToBootloader(), so this is
+        // safe to call unconditionally — the transport decides what to do.
         await _transport.resetToBootloader();
         try {
           final response = await _transport.sendCommand(
