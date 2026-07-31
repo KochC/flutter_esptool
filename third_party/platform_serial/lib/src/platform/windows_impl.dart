@@ -181,8 +181,10 @@ class WindowsSerialImpl implements SerialPlatformInterface {
     // Instead of blocking the Dart isolate via WinAPI ReadFile with a timeout,
     // we poll bytesAvailable() in an async loop and only call readPort() when
     // data is actually present — keeping the Flutter UI isolate responsive.
+    // Use a generous internal deadline; the outer SerialPort.read() wraps this
+    // with a .timeout() that enforces the caller's per-call deadline.
     final deadlineMs = DateTime.now().millisecondsSinceEpoch +
-        const Duration(seconds: 5).inMilliseconds;
+        const Duration(seconds: 30).inMilliseconds;
 
     while (true) {
       final available = await bytesAvailable(portName);
@@ -222,7 +224,14 @@ class WindowsSerialImpl implements SerialPlatformInterface {
       }
 
       if (DateTime.now().millisecondsSinceEpoch >= deadlineMs) {
-        return Uint8List(0); // timeout — caller treats empty as a timeout
+        // Throw a proper timeout error so the caller (esp_transport._readFrame)
+        // can distinguish "no data yet" from a real read error and keep waiting
+        // up to its own (longer) deadline, rather than treating an empty return
+        // as a completed-but-empty read and potentially triggering partialPacket.
+        throw SerialError(
+          type: SerialErrorType.timeout,
+          message: 'Read timeout on Windows port $portName',
+        );
       }
 
       // Yield to the event loop before polling again.

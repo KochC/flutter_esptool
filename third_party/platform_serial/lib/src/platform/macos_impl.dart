@@ -170,7 +170,14 @@ class MacOSSerialImpl {
 
       // No data yet — check deadline before yielding.
       if (DateTime.now().millisecondsSinceEpoch >= deadlineMs) {
-        return Uint8List(0); // timeout — caller treats empty as a timeout
+        // Throw a proper timeout error so the caller (esp_transport._readFrame)
+        // can distinguish "no data yet" from a real read error and keep waiting
+        // up to its own (longer) deadline, rather than treating an empty return
+        // as a completed-but-empty read and potentially triggering partialPacket.
+        throw SerialError(
+          type: SerialErrorType.timeout,
+          message: 'Read timeout on macOS port $portName',
+        );
       }
 
       // Yield to the event loop for one frame (~1 ms) before polling again.
