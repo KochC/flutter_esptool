@@ -193,7 +193,10 @@ class EspTransport implements EspTransportInterface {
         await Future<void>.delayed(const Duration(milliseconds: 40));
       }
     }
-    await serial.flush();
+    // Do NOT call serial.flush() here — on macOS it calls tcdrain() which
+    // blocks the isolate until all bytes drain at hardware level.  The DTR/RTS
+    // pin toggles above are fire-and-forget; there is nothing in the TX buffer
+    // that needs draining.
     // Flush the hardware receive buffer and the in-memory read buffer so
     // that boot-loader messages emitted during the reset pulse do not
     // contaminate the next SYNC attempt.
@@ -228,7 +231,10 @@ class EspTransport implements EspTransportInterface {
 
     try {
       await serial.write(frame, timeout: effectiveTimeout);
-      await serial.flush();
+      // Do NOT call serial.flush() here — on macOS it calls tcdrain() which
+      // blocks the isolate until all bytes have been transmitted at the hardware
+      // level. Our non-blocking write already hands bytes to the kernel buffer;
+      // USB CDC/ACM flushes automatically at full USB bandwidth.
     } on SerialError catch (error, stackTrace) {
       final mapped = _mapSerialError(error, stackTrace);
       logger?.call(
