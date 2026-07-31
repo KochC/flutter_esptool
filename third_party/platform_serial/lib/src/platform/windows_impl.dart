@@ -5,7 +5,6 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io';
-import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
@@ -77,22 +76,20 @@ class WindowsSerialImpl implements SerialPlatformInterface {
       _bindings.freeString(payloadPointer);
 
       final decoded = jsonDecode(payload) as List<dynamic>;
-      return decoded
-          .map((dynamic item) {
-            final port = Map<String, dynamic>.from(
-              item as Map<dynamic, dynamic>,
-            );
-            return SerialPortInfo(
-              portName: port['portName'] as String? ?? 'Unknown',
-              description: port['description'] as String? ?? '',
-              vendorId: port['vendorId'] as String?,
-              productId: port['productId'] as String?,
-              serialNumber: port['serialNumber'] as String?,
-              isOpen: port['isOpen'] as bool? ?? false,
-              platform: port['platform'] as String? ?? 'windows',
-            );
-          })
-          .toList(growable: false);
+      return decoded.map((dynamic item) {
+        final port = Map<String, dynamic>.from(
+          item as Map<dynamic, dynamic>,
+        );
+        return SerialPortInfo(
+          portName: port['portName'] as String? ?? 'Unknown',
+          description: port['description'] as String? ?? '',
+          vendorId: port['vendorId'] as String?,
+          productId: port['productId'] as String?,
+          serialNumber: port['serialNumber'] as String?,
+          isOpen: port['isOpen'] as bool? ?? false,
+          platform: port['platform'] as String? ?? 'windows',
+        );
+      }).toList(growable: false);
     } finally {
       calloc.free(jsonPointer);
       calloc.free(errorCodePointer);
@@ -177,97 +174,59 @@ class WindowsSerialImpl implements SerialPlatformInterface {
 
   @override
   Future<Uint8List> readData(String portName, int length) async {
-    if (length <= 0) {
-      return Uint8List(0);
-    }
+    if (length <= 0) return Uint8List(0);
 
     final context = _requireContext(portName);
 
-    // The underlying WinAPI ReadFile blocks for up to the configured timeout.
-    // Offloading to a helper isolate keeps the Dart UI isolate responsive
-    // while waiting for data.  We capture the portId integer (plain int, safe
-    // to copy across isolate boundaries) and perform the full FFI call there.
-    final portId = context.portId;
+    // Instead of blocking the Dart isolate via WinAPI ReadFile with a timeout,
+    // we poll bytesAvailable() in an async loop and only call readPort() when
+    // data is actually present — keeping the Flutter UI isolate responsive.
+    final deadlineMs = DateTime.now().millisecondsSinceEpoch +
+        const Duration(seconds: 5).inMilliseconds;
 
-    // _ReadResult carries the raw values out of the helper isolate so that
-    // error mapping (which involves non-sendable types) happens on the
-    // calling isolate.
-    final result = await Isolate.run(() {
-      final buffer = calloc<Uint8>(length);
-      final bytesReadPointer = calloc<Int32>();
-      final errorCodePointer = calloc<Uint32>();
-      final errorMessagePointer = calloc<Pointer<Utf8>>();
+    while (true) {
+      final available = await bytesAvailable(portName);
 
-      try {
-        final status = _bindings.readPort(
-          portId,
-          buffer,
-          length,
-          bytesReadPointer,
-          errorCodePointer,
-          errorMessagePointer,
-        );
+      if (available > 0) {
+        final readLength = available < length ? available : length;
+        final buffer = calloc<Uint8>(readLength);
+        final bytesReadPointer = calloc<Int32>();
+        final errorCodePointer = calloc<Uint32>();
+        final errorMessagePointer = calloc<Pointer<Utf8>>();
 
-        final bytes = status == _kFlutterSerialSuccess
-            ? Uint8List.fromList(buffer.asTypedList(bytesReadPointer.value))
-            : null;
-        final errorCode = errorCodePointer.value;
-        final errorMsg = errorMessagePointer.value != nullptr
-            ? errorMessagePointer.value.toDartString()
-            : null;
+        try {
+          final status = _bindings.readPort(
+            context.portId,
+            buffer,
+            readLength,
+            bytesReadPointer,
+            errorCodePointer,
+            errorMessagePointer,
+          );
+          _ensureSuccess(
+            status,
+            errorCodePointer.value,
+            errorMessagePointer.value,
+            'Error reading on Windows',
+          );
 
-        // Free FFI memory before leaving the isolate.
-        if (errorMessagePointer.value != nullptr) {
-          _bindings.freeString(errorMessagePointer.value);
+          final bytesRead = bytesReadPointer.value;
+          if (bytesRead <= 0) return Uint8List(0);
+          return Uint8List.fromList(buffer.asTypedList(bytesRead));
+        } finally {
+          calloc.free(buffer);
+          calloc.free(bytesReadPointer);
+          calloc.free(errorCodePointer);
+          calloc.free(errorMessagePointer);
         }
-
-        return (status: status, bytes: bytes, errorCode: errorCode, errorMsg: errorMsg);
-      } finally {
-        calloc.free(buffer);
-        calloc.free(bytesReadPointer);
-        calloc.free(errorCodePointer);
-        calloc.free(errorMessagePointer);
       }
-    });
 
-    if (result.status != _kFlutterSerialSuccess) {
-      final msg = result.errorMsg ?? 'Error reading on Windows';
-      throw SerialError(
-        type: _mapStatus(result.status),
-        message: '$msg (Windows error code: ${result.errorCode})',
-      );
-    }
-    return result.bytes ?? Uint8List(0);
-  }
+      if (DateTime.now().millisecondsSinceEpoch >= deadlineMs) {
+        return Uint8List(0); // timeout — caller treats empty as a timeout
+      }
 
-    final context = _requireContext(portName);
-    final buffer = calloc<Uint8>(length);
-    final bytesReadPointer = calloc<Int32>();
-    final errorCodePointer = calloc<Uint32>();
-    final errorMessagePointer = calloc<Pointer<Utf8>>();
-
-    try {
-      final status = _bindings.readPort(
-        context.portId,
-        buffer,
-        length,
-        bytesReadPointer,
-        errorCodePointer,
-        errorMessagePointer,
-      );
-      _ensureSuccess(
-        status,
-        errorCodePointer.value,
-        errorMessagePointer.value,
-        'Error reading on Windows',
-      );
-
-      return Uint8List.fromList(buffer.asTypedList(bytesReadPointer.value));
-    } finally {
-      calloc.free(buffer);
-      calloc.free(bytesReadPointer);
-      calloc.free(errorCodePointer);
-      calloc.free(errorMessagePointer);
+      // Yield to the event loop before polling again.
+      await Future<void>.delayed(const Duration(milliseconds: 1));
     }
   }
 
@@ -472,15 +431,15 @@ class WindowsSerialImpl implements SerialPlatformInterface {
   @override
   Stream<dynamic> getEventStream(String portName) {
     final context = _requireContext(portName);
-    final controller = context.controller ??=
-        StreamController<dynamic>.broadcast(
-          onListen: () => _startPolling(context),
-          onCancel: () {
-            if (!(context.controller?.hasListener ?? false)) {
-              context.stopPolling();
-            }
-          },
-        );
+    final controller =
+        context.controller ??= StreamController<dynamic>.broadcast(
+      onListen: () => _startPolling(context),
+      onCancel: () {
+        if (!(context.controller?.hasListener ?? false)) {
+          context.stopPolling();
+        }
+      },
+    );
     return controller.stream;
   }
 
@@ -612,45 +571,45 @@ final class _WindowsPortContext {
 
 final class _FlutterSerialBindings {
   _FlutterSerialBindings(DynamicLibrary library)
-    : getPorts = library.lookupFunction<_GetPortsNative, _GetPortsDart>(
-        'platform_serial_get_ports',
-      ),
-      openPort = library.lookupFunction<_OpenPortNative, _OpenPortDart>(
-        'platform_serial_open_port',
-      ),
-      closePort = library.lookupFunction<_ClosePortNative, _ClosePortDart>(
-        'platform_serial_close_port',
-      ),
-      readPort = library.lookupFunction<_ReadPortNative, _ReadPortDart>(
-        'platform_serial_read_port',
-      ),
-      writePort = library.lookupFunction<_WritePortNative, _WritePortDart>(
-        'platform_serial_write_port',
-      ),
-      bytesAvailable = library
-          .lookupFunction<_BytesAvailableNative, _BytesAvailableDart>(
-            'platform_serial_bytes_available',
-          ),
-      flushPort = library.lookupFunction<_FlushPortNative, _FlushPortDart>(
-        'platform_serial_flush_port',
-      ),
-      resetPortBuffers = library
-          .lookupFunction<_ResetPortBuffersNative, _ResetPortBuffersDart>(
-            'platform_serial_reset_port_buffers',
-          ),
-      getControlSignals = library
-          .lookupFunction<_GetControlSignalsNative, _GetControlSignalsDart>(
-            'platform_serial_get_control_signals',
-          ),
-      setDtr = library.lookupFunction<_SetDtrNative, _SetDtrDart>(
-        'platform_serial_set_dtr',
-      ),
-      setRts = library.lookupFunction<_SetRtsNative, _SetRtsDart>(
-        'platform_serial_set_rts',
-      ),
-      freeString = library.lookupFunction<_FreeStringNative, _FreeStringDart>(
-        'platform_serial_free_string',
-      );
+      : getPorts = library.lookupFunction<_GetPortsNative, _GetPortsDart>(
+          'platform_serial_get_ports',
+        ),
+        openPort = library.lookupFunction<_OpenPortNative, _OpenPortDart>(
+          'platform_serial_open_port',
+        ),
+        closePort = library.lookupFunction<_ClosePortNative, _ClosePortDart>(
+          'platform_serial_close_port',
+        ),
+        readPort = library.lookupFunction<_ReadPortNative, _ReadPortDart>(
+          'platform_serial_read_port',
+        ),
+        writePort = library.lookupFunction<_WritePortNative, _WritePortDart>(
+          'platform_serial_write_port',
+        ),
+        bytesAvailable =
+            library.lookupFunction<_BytesAvailableNative, _BytesAvailableDart>(
+          'platform_serial_bytes_available',
+        ),
+        flushPort = library.lookupFunction<_FlushPortNative, _FlushPortDart>(
+          'platform_serial_flush_port',
+        ),
+        resetPortBuffers = library
+            .lookupFunction<_ResetPortBuffersNative, _ResetPortBuffersDart>(
+          'platform_serial_reset_port_buffers',
+        ),
+        getControlSignals = library
+            .lookupFunction<_GetControlSignalsNative, _GetControlSignalsDart>(
+          'platform_serial_get_control_signals',
+        ),
+        setDtr = library.lookupFunction<_SetDtrNative, _SetDtrDart>(
+          'platform_serial_set_dtr',
+        ),
+        setRts = library.lookupFunction<_SetRtsNative, _SetRtsDart>(
+          'platform_serial_set_rts',
+        ),
+        freeString = library.lookupFunction<_FreeStringNative, _FreeStringDart>(
+          'platform_serial_free_string',
+        );
 
   final _GetPortsDart getPorts;
   final _OpenPortDart openPort;
@@ -666,130 +625,120 @@ final class _FlutterSerialBindings {
   final _FreeStringDart freeString;
 }
 
-typedef _GetPortsNative =
-    Int32 Function(
-      Pointer<Pointer<Utf8>>,
-      Pointer<Uint32>,
-      Pointer<Pointer<Utf8>>,
-    );
-typedef _GetPortsDart =
-    int Function(
-      Pointer<Pointer<Utf8>>,
-      Pointer<Uint32>,
-      Pointer<Pointer<Utf8>>,
-    );
+typedef _GetPortsNative = Int32 Function(
+  Pointer<Pointer<Utf8>>,
+  Pointer<Uint32>,
+  Pointer<Pointer<Utf8>>,
+);
+typedef _GetPortsDart = int Function(
+  Pointer<Pointer<Utf8>>,
+  Pointer<Uint32>,
+  Pointer<Pointer<Utf8>>,
+);
 
-typedef _OpenPortNative =
-    Int32 Function(
-      Pointer<Utf16>,
-      Int32,
-      Int32,
-      Int32,
-      Int32,
-      Int32,
-      Int32,
-      Int32,
-      Pointer<Int64>,
-      Pointer<Uint32>,
-      Pointer<Pointer<Utf8>>,
-    );
-typedef _OpenPortDart =
-    int Function(
-      Pointer<Utf16>,
-      int,
-      int,
-      int,
-      int,
-      int,
-      int,
-      int,
-      Pointer<Int64>,
-      Pointer<Uint32>,
-      Pointer<Pointer<Utf8>>,
-    );
+typedef _OpenPortNative = Int32 Function(
+  Pointer<Utf16>,
+  Int32,
+  Int32,
+  Int32,
+  Int32,
+  Int32,
+  Int32,
+  Int32,
+  Pointer<Int64>,
+  Pointer<Uint32>,
+  Pointer<Pointer<Utf8>>,
+);
+typedef _OpenPortDart = int Function(
+  Pointer<Utf16>,
+  int,
+  int,
+  int,
+  int,
+  int,
+  int,
+  int,
+  Pointer<Int64>,
+  Pointer<Uint32>,
+  Pointer<Pointer<Utf8>>,
+);
 
-typedef _ClosePortNative =
-    Int32 Function(Int64, Pointer<Uint32>, Pointer<Pointer<Utf8>>);
-typedef _ClosePortDart =
-    int Function(int, Pointer<Uint32>, Pointer<Pointer<Utf8>>);
+typedef _ClosePortNative = Int32 Function(
+    Int64, Pointer<Uint32>, Pointer<Pointer<Utf8>>);
+typedef _ClosePortDart = int Function(
+    int, Pointer<Uint32>, Pointer<Pointer<Utf8>>);
 
-typedef _ReadPortNative =
-    Int32 Function(
-      Int64,
-      Pointer<Uint8>,
-      Int32,
-      Pointer<Int32>,
-      Pointer<Uint32>,
-      Pointer<Pointer<Utf8>>,
-    );
-typedef _ReadPortDart =
-    int Function(
-      int,
-      Pointer<Uint8>,
-      int,
-      Pointer<Int32>,
-      Pointer<Uint32>,
-      Pointer<Pointer<Utf8>>,
-    );
+typedef _ReadPortNative = Int32 Function(
+  Int64,
+  Pointer<Uint8>,
+  Int32,
+  Pointer<Int32>,
+  Pointer<Uint32>,
+  Pointer<Pointer<Utf8>>,
+);
+typedef _ReadPortDart = int Function(
+  int,
+  Pointer<Uint8>,
+  int,
+  Pointer<Int32>,
+  Pointer<Uint32>,
+  Pointer<Pointer<Utf8>>,
+);
 
-typedef _WritePortNative =
-    Int32 Function(
-      Int64,
-      Pointer<Uint8>,
-      Int32,
-      Pointer<Int32>,
-      Pointer<Uint32>,
-      Pointer<Pointer<Utf8>>,
-    );
-typedef _WritePortDart =
-    int Function(
-      int,
-      Pointer<Uint8>,
-      int,
-      Pointer<Int32>,
-      Pointer<Uint32>,
-      Pointer<Pointer<Utf8>>,
-    );
+typedef _WritePortNative = Int32 Function(
+  Int64,
+  Pointer<Uint8>,
+  Int32,
+  Pointer<Int32>,
+  Pointer<Uint32>,
+  Pointer<Pointer<Utf8>>,
+);
+typedef _WritePortDart = int Function(
+  int,
+  Pointer<Uint8>,
+  int,
+  Pointer<Int32>,
+  Pointer<Uint32>,
+  Pointer<Pointer<Utf8>>,
+);
 
-typedef _BytesAvailableNative =
-    Int32 Function(
-      Int64,
-      Pointer<Int32>,
-      Pointer<Uint32>,
-      Pointer<Pointer<Utf8>>,
-    );
-typedef _BytesAvailableDart =
-    int Function(int, Pointer<Int32>, Pointer<Uint32>, Pointer<Pointer<Utf8>>);
+typedef _BytesAvailableNative = Int32 Function(
+  Int64,
+  Pointer<Int32>,
+  Pointer<Uint32>,
+  Pointer<Pointer<Utf8>>,
+);
+typedef _BytesAvailableDart = int Function(
+    int, Pointer<Int32>, Pointer<Uint32>, Pointer<Pointer<Utf8>>);
 
-typedef _FlushPortNative =
-    Int32 Function(Int64, Pointer<Uint32>, Pointer<Pointer<Utf8>>);
-typedef _FlushPortDart =
-    int Function(int, Pointer<Uint32>, Pointer<Pointer<Utf8>>);
+typedef _FlushPortNative = Int32 Function(
+    Int64, Pointer<Uint32>, Pointer<Pointer<Utf8>>);
+typedef _FlushPortDart = int Function(
+    int, Pointer<Uint32>, Pointer<Pointer<Utf8>>);
 
-typedef _ResetPortBuffersNative =
-    Int32 Function(Int64, Pointer<Uint32>, Pointer<Pointer<Utf8>>);
-typedef _ResetPortBuffersDart =
-    int Function(int, Pointer<Uint32>, Pointer<Pointer<Utf8>>);
+typedef _ResetPortBuffersNative = Int32 Function(
+    Int64, Pointer<Uint32>, Pointer<Pointer<Utf8>>);
+typedef _ResetPortBuffersDart = int Function(
+    int, Pointer<Uint32>, Pointer<Pointer<Utf8>>);
 
-typedef _GetControlSignalsNative =
-    Int32 Function(
-      Int64,
-      Pointer<Uint32>,
-      Pointer<Uint32>,
-      Pointer<Pointer<Utf8>>,
-    );
-typedef _GetControlSignalsDart =
-    int Function(int, Pointer<Uint32>, Pointer<Uint32>, Pointer<Pointer<Utf8>>);
+typedef _GetControlSignalsNative = Int32 Function(
+  Int64,
+  Pointer<Uint32>,
+  Pointer<Uint32>,
+  Pointer<Pointer<Utf8>>,
+);
+typedef _GetControlSignalsDart = int Function(
+    int, Pointer<Uint32>, Pointer<Uint32>, Pointer<Pointer<Utf8>>);
 
-typedef _SetDtrNative =
-    Int32 Function(Int64, Int32, Pointer<Uint32>, Pointer<Pointer<Utf8>>);
-typedef _SetDtrDart =
-    int Function(int, int, Pointer<Uint32>, Pointer<Pointer<Utf8>>);
+typedef _SetDtrNative = Int32 Function(
+    Int64, Int32, Pointer<Uint32>, Pointer<Pointer<Utf8>>);
+typedef _SetDtrDart = int Function(
+    int, int, Pointer<Uint32>, Pointer<Pointer<Utf8>>);
 
-typedef _SetRtsNative =
-    Int32 Function(Int64, Int32, Pointer<Uint32>, Pointer<Pointer<Utf8>>);
-typedef _SetRtsDart =
-    int Function(int, int, Pointer<Uint32>, Pointer<Pointer<Utf8>>);
+typedef _SetRtsNative = Int32 Function(
+    Int64, Int32, Pointer<Uint32>, Pointer<Pointer<Utf8>>);
+typedef _SetRtsDart = int Function(
+    int, int, Pointer<Uint32>, Pointer<Pointer<Utf8>>);
 
 typedef _FreeStringNative = Void Function(Pointer<Utf8>);
 typedef _FreeStringDart = void Function(Pointer<Utf8>);

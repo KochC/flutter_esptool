@@ -4,7 +4,6 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:ffi' as ffi;
 import 'dart:io' show Platform;
-import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
@@ -125,51 +124,50 @@ class MacOSSerialImpl {
     }
   }
 
-  /// Reads data from the port using the natively configured timeout.
+  /// Reads up to [length] bytes from the port, waiting up to [readTimeoutMs].
   ///
-  /// The underlying C `read()` call blocks for up to [readTimeoutMs] ms if no
-  /// data is available.  Running the FFI call inside [Isolate.run] keeps the
-  /// Dart UI isolate responsive during long waits without changing the
-  /// public async API contract.
+  /// Instead of passing the full timeout to the blocking C `read()` call
+  /// (which would stall the Dart isolate for the entire duration), this method
+  /// polls `bytesAvailable()` in a Dart async loop and only calls the native
+  /// `read()` when data is actually present — using timeout=0 so the C call
+  /// returns immediately.  Between polls it yields via [Future.delayed] so
+  /// the Flutter UI isolate stays fully responsive.
   static Future<Uint8List> readData(String portName, int length) async {
     final state = _requirePort(portName);
-    final safeLength = length <= 0 ? 0 : length;
+    if (length <= 0) return Uint8List(0);
 
-    // FFI handle and timeout are plain integers – safe to copy across isolate
-    // boundaries.
     final handle = state.handle;
-    final timeoutMs = state.readTimeoutMs;
+    final deadlineMs =
+        DateTime.now().millisecondsSinceEpoch + state.readTimeoutMs;
 
-    // _ReadResult carries the raw values out so error-mapping (which involves
-    // non-sendable types like SerialError) happens on the calling isolate.
-    final result = await Isolate.run(() {
-      final buffer = calloc<ffi.Uint8>(safeLength == 0 ? 1 : safeLength);
-      try {
-        final bytesRead = _bindings.read(handle, buffer, safeLength, timeoutMs);
-        if (bytesRead < 0) {
-          return (ok: false, bytes: Uint8List(0));
-        }
-        if (bytesRead == 0) {
-          return (ok: true, bytes: Uint8List(0));
-        }
-        return (ok: true, bytes: Uint8List.fromList(buffer.asTypedList(bytesRead)));
-      } finally {
-        calloc.free(buffer);
-      }
-    });
-
-    if (!result.ok) {
-      throw _lastError('Error reading on macOS');
-    }
-    return result.bytes;
-  }
-      if (bytesRead == 0) {
-        return Uint8List(0);
+    while (true) {
+      // Check how many bytes are available without blocking.
+      final available = _bindings.bytesAvailable(handle);
+      if (available < 0) {
+        throw _lastError('Error reading on macOS');
       }
 
-      return Uint8List.fromList(buffer.asTypedList(bytesRead));
-    } finally {
-      calloc.free(buffer);
+      if (available > 0) {
+        // Data is ready — read immediately with timeout=0 (non-blocking).
+        final readLength = available < length ? available : length;
+        final buffer = calloc<ffi.Uint8>(readLength);
+        try {
+          final bytesRead = _bindings.read(handle, buffer, readLength, 0);
+          if (bytesRead < 0) throw _lastError('Error reading on macOS');
+          if (bytesRead == 0) return Uint8List(0);
+          return Uint8List.fromList(buffer.asTypedList(bytesRead));
+        } finally {
+          calloc.free(buffer);
+        }
+      }
+
+      // No data yet — check deadline before yielding.
+      if (DateTime.now().millisecondsSinceEpoch >= deadlineMs) {
+        return Uint8List(0); // timeout — caller treats empty as a timeout
+      }
+
+      // Yield to the event loop for one frame (~1 ms) before polling again.
+      await Future<void>.delayed(const Duration(milliseconds: 1));
     }
   }
 
@@ -287,34 +285,31 @@ class MacOSSerialImpl {
   }
 }
 
-typedef _GetAvailablePortsJsonNative =
-    ffi.Int32 Function(ffi.Pointer<ffi.Pointer<Utf8>>);
-typedef _OpenPortNative =
-    ffi.IntPtr Function(
-      ffi.Pointer<Utf8>,
-      ffi.Int32,
-      ffi.Int32,
-      ffi.Int32,
-      ffi.Int32,
-      ffi.Int32,
-      ffi.Int32,
-      ffi.Int32,
-    );
+typedef _GetAvailablePortsJsonNative = ffi.Int32 Function(
+    ffi.Pointer<ffi.Pointer<Utf8>>);
+typedef _OpenPortNative = ffi.IntPtr Function(
+  ffi.Pointer<Utf8>,
+  ffi.Int32,
+  ffi.Int32,
+  ffi.Int32,
+  ffi.Int32,
+  ffi.Int32,
+  ffi.Int32,
+  ffi.Int32,
+);
 typedef _ClosePortNative = ffi.Int32 Function(ffi.IntPtr);
-typedef _ReadNative =
-    ffi.Int32 Function(
-      ffi.IntPtr,
-      ffi.Pointer<ffi.Uint8>,
-      ffi.Int32,
-      ffi.Int32,
-    );
-typedef _WriteNative =
-    ffi.Int32 Function(
-      ffi.IntPtr,
-      ffi.Pointer<ffi.Uint8>,
-      ffi.Int32,
-      ffi.Int32,
-    );
+typedef _ReadNative = ffi.Int32 Function(
+  ffi.IntPtr,
+  ffi.Pointer<ffi.Uint8>,
+  ffi.Int32,
+  ffi.Int32,
+);
+typedef _WriteNative = ffi.Int32 Function(
+  ffi.IntPtr,
+  ffi.Pointer<ffi.Uint8>,
+  ffi.Int32,
+  ffi.Int32,
+);
 typedef _HandleOnlyNative = ffi.Int32 Function(ffi.IntPtr);
 typedef _WaitReadableNative = ffi.Int32 Function(ffi.IntPtr, ffi.Int32);
 typedef _GetLastErrorCodeNative = ffi.Int32 Function();
@@ -324,62 +319,51 @@ typedef _FreeMemoryNative = ffi.Void Function(ffi.Pointer<ffi.Void>);
 /// Lazy wrapper for the native functions exposed by the macOS pod.
 class _MacOSSerialBindings {
   _MacOSSerialBindings._(ffi.DynamicLibrary library)
-    : getAvailablePortsJson = library
-          .lookupFunction<
-            _GetAvailablePortsJsonNative,
-            int Function(ffi.Pointer<ffi.Pointer<Utf8>>)
-          >('serial_get_available_ports_json'),
-      openPort = library
-          .lookupFunction<
+      : getAvailablePortsJson = library.lookupFunction<
+                _GetAvailablePortsJsonNative,
+                int Function(ffi.Pointer<ffi.Pointer<Utf8>>)>(
+            'serial_get_available_ports_json'),
+        openPort = library.lookupFunction<
             _OpenPortNative,
-            int Function(ffi.Pointer<Utf8>, int, int, int, int, int, int, int)
-          >('serial_open_port'),
-      closePort = library.lookupFunction<_ClosePortNative, int Function(int)>(
-        'serial_close_port',
-      ),
-      read = library
-          .lookupFunction<
-            _ReadNative,
-            int Function(int, ffi.Pointer<ffi.Uint8>, int, int)
-          >('serial_read'),
-      write = library
-          .lookupFunction<
+            int Function(ffi.Pointer<Utf8>, int, int, int, int, int, int,
+                int)>('serial_open_port'),
+        closePort = library.lookupFunction<_ClosePortNative, int Function(int)>(
+          'serial_close_port',
+        ),
+        read = library.lookupFunction<_ReadNative,
+            int Function(int, ffi.Pointer<ffi.Uint8>, int, int)>('serial_read'),
+        write = library.lookupFunction<
             _WriteNative,
-            int Function(int, ffi.Pointer<ffi.Uint8>, int, int)
-          >('serial_write'),
-      bytesAvailable = library
-          .lookupFunction<_HandleOnlyNative, int Function(int)>(
-            'serial_bytes_available',
-          ),
-      waitReadable = library
-          .lookupFunction<_WaitReadableNative, int Function(int, int)>(
-            'serial_wait_readable',
-          ),
-      flush = library.lookupFunction<_HandleOnlyNative, int Function(int)>(
-        'serial_flush',
-      ),
-      resetBuffers = library
-          .lookupFunction<_HandleOnlyNative, int Function(int)>(
-            'serial_reset_buffers',
-          ),
-      getLastErrorCode = library
-          .lookupFunction<_GetLastErrorCodeNative, int Function()>(
-            'serial_get_last_error_code',
-          ),
-      copyLastErrorMessage = library
-          .lookupFunction<
+            int Function(
+                int, ffi.Pointer<ffi.Uint8>, int, int)>('serial_write'),
+        bytesAvailable =
+            library.lookupFunction<_HandleOnlyNative, int Function(int)>(
+          'serial_bytes_available',
+        ),
+        waitReadable =
+            library.lookupFunction<_WaitReadableNative, int Function(int, int)>(
+          'serial_wait_readable',
+        ),
+        flush = library.lookupFunction<_HandleOnlyNative, int Function(int)>(
+          'serial_flush',
+        ),
+        resetBuffers =
+            library.lookupFunction<_HandleOnlyNative, int Function(int)>(
+          'serial_reset_buffers',
+        ),
+        getLastErrorCode =
+            library.lookupFunction<_GetLastErrorCodeNative, int Function()>(
+          'serial_get_last_error_code',
+        ),
+        copyLastErrorMessage = library.lookupFunction<
             _CopyLastErrorMessageNative,
-            ffi.Pointer<Utf8> Function()
-          >('serial_copy_last_error_message'),
-      freeMemory = library
-          .lookupFunction<
-            _FreeMemoryNative,
-            void Function(ffi.Pointer<ffi.Void>)
-          >('serial_free_memory');
+            ffi.Pointer<Utf8> Function()>('serial_copy_last_error_message'),
+        freeMemory = library.lookupFunction<_FreeMemoryNative,
+            void Function(ffi.Pointer<ffi.Void>)>('serial_free_memory');
 
   final int Function(ffi.Pointer<ffi.Pointer<Utf8>>) getAvailablePortsJson;
   final int Function(ffi.Pointer<Utf8>, int, int, int, int, int, int, int)
-  openPort;
+      openPort;
   final int Function(int) closePort;
   final int Function(int, ffi.Pointer<ffi.Uint8>, int, int) read;
   final int Function(int, ffi.Pointer<ffi.Uint8>, int, int) write;
