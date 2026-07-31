@@ -68,7 +68,7 @@ typedef EspTransportLogger = void Function(EspTransportLogEntry entry);
 class EspTransport implements EspTransportInterface {
   /// Creates an [EspTransport].
   EspTransport({SerialPortInterface? serial, this.logger})
-      : serial = serial ?? SerialManager().createPort();
+    : serial = serial ?? SerialManager().createPort();
 
   /// The wrapped serial port implementation.
   final SerialPortInterface serial;
@@ -324,6 +324,9 @@ class EspTransport implements EspTransportInterface {
           ),
         );
         _readBuffer.clear();
+        // Yield to the event loop so that a stream of bad frames does not
+        // spin-lock the UI isolate before the next serial read.
+        await Future<void>.delayed(Duration.zero);
         continue;
       }
       if (existing != null) {
@@ -346,6 +349,9 @@ class EspTransport implements EspTransportInterface {
         if (error.type != SerialErrorType.timeout) {
           throw _mapSerialError(error, stackTrace);
         }
+        // A serial timeout means no data arrived yet.  Yield once so that a
+        // driver that returns timeout immediately does not spin-lock the isolate.
+        await Future<void>.delayed(Duration.zero);
       }
     }
 
@@ -408,10 +414,7 @@ class EspTransport implements EspTransportInterface {
         // a serial-read round-trip.
         return _tryExtractFrame();
       }
-      return _FrameReadResult(
-        rawFrame: rawFrame,
-        packet: frame,
-      );
+      return _FrameReadResult(rawFrame: rawFrame, packet: frame);
     }
 
     if (start > 0) {
@@ -475,10 +478,7 @@ class EspTransport implements EspTransportInterface {
 }
 
 class _FrameReadResult {
-  const _FrameReadResult({
-    required this.rawFrame,
-    required this.packet,
-  });
+  const _FrameReadResult({required this.rawFrame, required this.packet});
 
   final Uint8List rawFrame;
   final Uint8List packet;
