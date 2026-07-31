@@ -3,8 +3,11 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:ffi' as ffi;
-import 'dart:io' show Platform;
+import 'dart:io';
 import 'dart:typed_data';
+
+final _dbg2 = File('/tmp/esp_debug.log').openWrite(mode: FileMode.append);
+void _dm(String msg) { _dbg2.writeln('${DateTime.now().toIso8601String()} $msg'); _dbg2.flush(); }
 
 import 'package:ffi/ffi.dart';
 
