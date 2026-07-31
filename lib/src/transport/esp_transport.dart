@@ -141,8 +141,8 @@ class EspTransport implements EspTransportInterface {
       } else if (_config?.resetMode == EspResetMode.usbJtag) {
         // USB JTAG/Serial reset (esptool USBJTAGSerialReset).
         // Used for ESP32-S2/S3/C3/C6/H2 chips with built-in USB peripheral
-        // (Espressif VID 0x303a).  DTR/RTS have inverted polarity over USB
-        // compared to classic UART adapters.
+        // (Espressif VID 0x303a).  After this sequence the USB device
+        // disconnects and re-enumerates — we close, wait, then reopen.
         await setRts(false);
         await setDtr(false); // Idle
         await Future<void>.delayed(const Duration(milliseconds: 100));
@@ -155,6 +155,24 @@ class EspTransport implements EspTransportInterface {
         await Future<void>.delayed(const Duration(milliseconds: 100));
         await setDtr(false);
         await setRts(false); // Chip out of reset, IO0 high → bootloader
+
+        // The USB device disconnects during reset and re-enumerates as a
+        // bootloader. Close the port, wait for re-enumeration, then reopen.
+        final config = _config!;
+        await serial.close();
+        await Future<void>.delayed(const Duration(milliseconds: 500));
+        await serial.open(SerialConfig(
+          portName: config.portName,
+          baudRate: config.initialBaudRate,
+          dataBits: 8,
+          stopBits: SerialStopBits.one,
+          parity: SerialParity.none,
+          flowControl: SerialFlowControl.none,
+          readTimeout: config.timeout,
+          writeTimeout: config.timeout,
+        ));
+        _readBuffer.clear();
+        return; // buffers already fresh — skip the flush/resetBuffers below
       } else {
         // Classic reset (esptool ClassicReset).
         await setDtr(false);
