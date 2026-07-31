@@ -155,15 +155,23 @@ class MacOSSerialImpl {
       }
 
       if (available > 0) {
-        // Data is ready — read immediately with timeout=0 (non-blocking).
+        // Data is ready — use a short timeout (5 ms) instead of 0 so the
+        // kernel has time to move USB CDC/ACM bytes from the USB layer into
+        // the tty buffer.  FIONREAD can report bytes available before they
+        // are readable via read(), so timeout=0 returns 0 even when
+        // available>0 on macOS USB serial ports.
         final readLength = available < length ? available : length;
         final buffer = calloc<ffi.Uint8>(readLength);
         try {
-          final bytesRead = _bindings.read(handle, buffer, readLength, 0);
+          final bytesRead = _bindings.read(handle, buffer, readLength, 5);
           print(
               '[MAC] native read: requested=$readLength got=$bytesRead available=$available');
           if (bytesRead < 0) throw _lastError('Error reading on macOS');
-          if (bytesRead == 0) return Uint8List(0);
+          if (bytesRead == 0) {
+            // Bytes not yet in tty buffer despite FIONREAD — yield and retry.
+            await Future<void>.delayed(const Duration(milliseconds: 1));
+            continue;
+          }
           final result = Uint8List.fromList(buffer.asTypedList(bytesRead));
           print(
               '[MAC] native bytes: ${result.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ')}');
