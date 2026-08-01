@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Piergiorgio Vagnozzi
 // Licensed under the MIT License.
 
-import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter_esptool/src/models/esp_command.dart';
@@ -10,12 +9,6 @@ import 'package:flutter_esptool/src/models/esp_error.dart';
 import 'package:flutter_esptool/src/transport/esp_transport_interface.dart';
 import 'package:flutter_esptool/src/transport/slip_codec.dart';
 import 'package:platform_serial/platform_serial.dart';
-
-final _dbg = File('/tmp/esp_debug.log').openWrite(mode: FileMode.append);
-void _d(String msg) {
-  _dbg.writeln('${DateTime.now().toIso8601String()} $msg');
-  _dbg.flush();
-}
 
 /// Log event type emitted by [EspTransport].
 enum EspTransportLogType {
@@ -142,7 +135,6 @@ class EspTransport implements EspTransportInterface {
         await serial.setDtr(dtrState);
       }
 
-      _d('[ESP] resetToBootloader mode=${_config?.resetMode}');
       if (_config?.resetMode == EspResetMode.none) {
         // No reset — device is assumed to already be in bootloader mode.
         // Just flush buffers below and return.
@@ -167,11 +159,8 @@ class EspTransport implements EspTransportInterface {
         // The USB device disconnects during reset and re-enumerates as a
         // bootloader. Close the port, wait for re-enumeration, then reopen.
         final config = _config!;
-        _d('[ESP] USB JTAG: closing port for re-enum');
         await serial.close();
-        _d('[ESP] USB JTAG: waiting 500ms for re-enum');
         await Future<void>.delayed(const Duration(milliseconds: 500));
-        _d('[ESP] USB JTAG: reopening port ${config.portName}');
         await serial.open(SerialConfig(
           portName: config.portName,
           baudRate: config.initialBaudRate,
@@ -183,7 +172,7 @@ class EspTransport implements EspTransportInterface {
           writeTimeout: config.timeout,
         ));
         _readBuffer.clear();
-        _d('[ESP] USB JTAG: port reopened OK');
+        return;
         return; // buffers already fresh — skip the flush/resetBuffers below
       } else {
         // Classic reset (esptool ClassicReset).
@@ -242,10 +231,7 @@ class EspTransport implements EspTransportInterface {
     );
 
     try {
-      _d('[ESP] write ${frame.length} bytes opcode=${command.opcode}: '
-          '${frame.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ')}');
       await serial.write(frame, timeout: effectiveTimeout);
-      _d('[ESP] write done');
       // Do NOT call serial.flush() here — on macOS it calls tcdrain() which
       // blocks the isolate until all bytes have been transmitted at the hardware
       // level. Our non-blocking write already hands bytes to the kernel buffer;
@@ -402,16 +388,11 @@ class EspTransport implements EspTransportInterface {
       try {
         final available = await serial.bytesAvailable();
         final readLength = available > 0 ? available : 1;
-        _d('[ESP] read poll: available=$available readLength=$readLength '
-            'remaining=${remaining.inMilliseconds}ms bufLen=${_readBuffer.length}');
         final chunk = await serial.read(readLength, timeout: remaining);
         if (chunk.isNotEmpty) {
-          _d('[ESP] read got ${chunk.length} bytes: '
-              '${chunk.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ')}');
           _readBuffer.add(chunk);
         }
       } on SerialError catch (error, stackTrace) {
-        _d('[ESP] serial error type=${error.type} msg=${error.message}');
         if (error.type != SerialErrorType.timeout) {
           throw _mapSerialError(error, stackTrace);
         }
@@ -424,15 +405,12 @@ class EspTransport implements EspTransportInterface {
     final trailing = _readBuffer.toBytes();
     _readBuffer.clear();
     if (trailing.isNotEmpty) {
-      _d('[ESP] partialPacket: ${trailing.length} bytes in buffer: '
-          '${trailing.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ')}');
       throw const EspError(
         type: EspErrorType.partialPacket,
         message: 'A complete SLIP frame was not received before timeout',
       );
     }
 
-    _d('[ESP] timeout: no bytes received');
     throw const EspError(
       type: EspErrorType.timeout,
       message: 'Timed out waiting for an ESP response',

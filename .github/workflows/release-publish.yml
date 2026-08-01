@@ -1,103 +1,206 @@
 name: Release and Publish
 
+# Triggers:
+#   • PR merged to main  → compute version with GitVersion, publish to
+#     pub.dev, open a version-bump PR to keep pubspec.yaml in sync.
+#   • Manual dispatch    → same pipeline (useful for retries / re-publish).
+#
+# Loop-break: the version-bump PR commit contains "[skip release]" so
+# when it merges back to main the workflow exits at step 2.
+
 on:
   pull_request:
     types: [closed]
     branches:
-      - stable
       - main
   workflow_dispatch:
-    inputs:
-      prerelease:
-        description: "Mark as pre-release (true for stable branch manual runs)"
-        required: false
-        default: "false"
 
 jobs:
   release-and-publish:
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request' &&
-      github.event.pull_request.merged == true)
+       github.event.pull_request.merged == true)
     runs-on: ubuntu-latest
     permissions:
       contents: write
       id-token: write
+      pull-requests: write
 
     steps:
+      # ── 1. Checkout with full git history (required by GitVersion) ─────────
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
+      # ── 2. Guard: skip version-bump merge-back commits ────────────────────
+      - name: Check for [skip release] flag
+        id: guard
+        shell: bash
+        run: |
+          MSG=$(git log -1 --pretty=%B)
+          echo "Commit: $MSG"
+          if echo "$MSG" | grep -qF '[skip release]'; then
+            echo "skip=true"  >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping — [skip release] detected."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── 3. Install GitVersion ─────────────────────────────────────────────
+      - name: Install GitVersion
+        if: steps.guard.outputs.skip == 'false'
+        uses: gittools/actions/gitversion/setup@v3.1
+        with:
+          versionSpec: '6.x'
+
+      # ── 4. Compute semantic version ────────────────────────────────────────
+      - name: Determine version
+        id: gitversion
+        if: steps.guard.outputs.skip == 'false'
+        uses: gittools/actions/gitversion/execute@v3.1
+        with:
+          useConfigFile: true
+
+      - name: Log computed version
+        if: steps.guard.outputs.skip == 'false'
+        shell: bash
+        run: |
+          echo "SemVer     : ${{ steps.gitversion.outputs.semVer }}"
+          echo "PreRelTag  : ${{ steps.gitversion.outputs.preReleaseTag }}"
+          echo "Is stable  : \
+            ${{ steps.gitversion.outputs.preReleaseTag == '' }}"
+
+      # ── 5. Setup Flutter + deps ────────────────────────────────────────────
       - name: Setup Flutter
+        if: steps.guard.outputs.skip == 'false'
         uses: subosito/flutter-action@v2
         with:
           channel: stable
 
       - name: Install dependencies
+        if: steps.guard.outputs.skip == 'false'
         run: flutter pub get
 
-      - name: Validate package
-        run: |
-          flutter analyze
-          flutter test
-          dart pub publish --dry-run
-
-      - name: Read package version
-        id: package_version
+      # ── 6. Patch pubspec.yaml with computed version (in-runner) ───────────
+      - name: Patch pubspec.yaml version
+        id: patch_version
+        if: steps.guard.outputs.skip == 'false'
         shell: bash
         run: |
-          VERSION=$(grep '^version:' pubspec.yaml | awk '{print $2}')
-          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
-
-      - name: Check if version already published on pub.dev
-        id: pub_check
-        shell: bash
-        run: |
-          VERSION="${{ steps.package_version.outputs.value }}"
-          PKG=$(grep '^name:' pubspec.yaml | awk '{print $2}')
-          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-            "https://pub.dev/api/packages/${PKG}/versions/${VERSION}")
-          if [ "$HTTP_STATUS" = "200" ]; then
-            echo "Version $VERSION already published — skipping."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
+          COMPUTED="${{ steps.gitversion.outputs.semVer }}"
+          CURRENT=$(grep '^version:' pubspec.yaml | awk '{print $2}')
+          echo "Computed : $COMPUTED"
+          echo "In repo  : $CURRENT"
+          sed -i "s/^version:.*/version: $COMPUTED/" pubspec.yaml
+          echo "value=$COMPUTED" >> "$GITHUB_OUTPUT"
+          if [ "$CURRENT" != "$COMPUTED" ]; then
+            echo "changed=true"  >> "$GITHUB_OUTPUT"
           else
-            echo "Version $VERSION not yet published — proceeding."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── 7. Check pub.dev to avoid duplicate publishes ─────────────────────
+      - name: Check pub.dev for existing version
+        id: pub_check
+        if: steps.guard.outputs.skip == 'false'
+        shell: bash
+        run: |
+          VER="${{ steps.patch_version.outputs.value }}"
+          PKG=$(grep '^name:' pubspec.yaml | awk '{print $2}')
+          HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
+            "https://pub.dev/api/packages/${PKG}/versions/${VER}")
+          if [ "$HTTP" = "200" ]; then
+            echo "Version $VER already on pub.dev — skipping publish."
+            echo "skip=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "Version $VER not on pub.dev — will publish."
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Determine release type
-        id: release_type
+      # ── 8. Validate: analyze + tests + dry-run ────────────────────────────
+      - name: Validate package
+        if: >-
+          steps.guard.outputs.skip    == 'false' &&
+          steps.pub_check.outputs.skip == 'false'
+        run: |
+          flutter analyze
+          flutter test test/unit test/integration test/e2e
+          dart pub publish --dry-run
+
+      # ── 9. Create Git tag ──────────────────────────────────────────────────
+      - name: Create Git tag
+        if: >-
+          steps.guard.outputs.skip    == 'false' &&
+          steps.pub_check.outputs.skip == 'false'
         shell: bash
         run: |
-          TARGET="${{ github.base_ref }}"
-          DISPATCH_PRE="${{ github.event.inputs.prerelease }}"
-          VERSION="${{ steps.package_version.outputs.value }}"
-
-          # stable branch or manual pre-release flag → pre-release
-          if [ "$TARGET" = "stable" ] || [ "$DISPATCH_PRE" = "true" ]; then
-            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
-          elif [[ "$VERSION" == *"-"* ]]; then
-            # version string contains a pre-release suffix (e.g. 1.0.0-rc.1)
-            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+          TAG="v${{ steps.patch_version.outputs.value }}"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists."
           else
-            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+            git config user.name  "github-actions[bot]"
+            git config user.email \
+              "github-actions[bot]@users.noreply.github.com"
+            git tag -a "$TAG" -m "Release $TAG"
+            git push origin "$TAG"
+            echo "::notice::Created and pushed tag $TAG"
           fi
 
+      # ── 10. Create GitHub release ─────────────────────────────────────────
       - name: Create GitHub release
+        if: >-
+          steps.guard.outputs.skip    == 'false' &&
+          steps.pub_check.outputs.skip == 'false'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ steps.package_version.outputs.value }}
-          name: v${{ steps.package_version.outputs.value }}
+          tag_name: v${{ steps.patch_version.outputs.value }}
+          name: v${{ steps.patch_version.outputs.value }}
           generate_release_notes: true
-          prerelease: ${{ steps.release_type.outputs.is_prerelease }}
-          make_latest: >
-            ${{ steps.release_type.outputs.is_prerelease == 'false' }}
-        continue-on-error: true   # skip if tag already exists
+          prerelease: >-
+            ${{ steps.gitversion.outputs.preReleaseTag != '' }}
+          make_latest: >-
+            ${{ steps.gitversion.outputs.preReleaseTag == '' }}
+        continue-on-error: true  # safe if tag already exists
 
+      # ── 11. Publish to pub.dev ────────────────────────────────────────────
       - name: Publish to pub.dev
-        if: steps.pub_check.outputs.skip == 'false'
+        if: >-
+          steps.guard.outputs.skip    == 'false' &&
+          steps.pub_check.outputs.skip == 'false'
         run: dart pub publish --force
         env:
           PUB_ENVIRONMENT: github-actions:release
+
+      # ── 12. Open version-bump PR to keep pubspec.yaml in sync ─────────────
+      # Only when the version actually changed.  The PR commit message
+      # carries "[skip release]" so when it merges to main it does NOT
+      # trigger another publish cycle.
+      - name: Create version-bump PR
+        if: >-
+          steps.guard.outputs.skip == 'false' &&
+          steps.patch_version.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: >-
+            chore/release-${{ steps.patch_version.outputs.value }}
+          delete-branch: true
+          commit-message: >-
+            chore: bump version to
+            ${{ steps.patch_version.outputs.value }} [skip release]
+          title: >-
+            chore: release v${{ steps.patch_version.outputs.value }}
+          body: |
+            Automated version bump to
+            `${{ steps.patch_version.outputs.value }}`.
+
+            - Published to pub.dev ✅
+            - GitHub release + tag created ✅
+            - Merging keeps `pubspec.yaml` in sync with the release tag.
+
+            > Opened automatically by the Release and Publish workflow.
+            > Will be auto-approved and merged by the CI bot.
+          labels: changelog
+          base: main

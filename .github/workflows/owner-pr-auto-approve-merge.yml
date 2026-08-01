@@ -5,11 +5,12 @@ on:
     workflows: ["PR Validation"]
     types: [completed]
 
-# Gitflow merge paths allowed for owner auto-approve:
-#   feat/* → dev
+# Gitflow merge paths allowed for auto-approve:
+#   feat/* | fix/* | hotfix/* | chore/* → dev
 #   dev    → test
 #   test   → stable
 #   stable → main
+#   chore/release-*  → main  (automated version-bump PRs from bot)
 
 jobs:
   approve-and-merge:
@@ -20,7 +21,7 @@ jobs:
       pull-requests: write
 
     steps:
-      - name: Auto-approve and merge owner PRs
+      - name: Auto-approve and merge eligible PRs
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -29,7 +30,7 @@ jobs:
             ${{ github.event.workflow_run.pull_requests[0].number }}
         run: |
           if [ -z "$PR_NUMBER" ]; then
-            echo "No pull request associated with this workflow run."
+            echo "No PR associated with this workflow run."
             exit 0
           fi
 
@@ -40,23 +41,48 @@ jobs:
           case "$BASE_REF" in
             dev|test|stable|main) ;;
             *)
-              echo "PR #$PR_NUMBER targets '$BASE_REF', skipping."
+              echo "PR #$PR_NUMBER targets '$BASE_REF' — skipping."
               exit 0
               ;;
           esac
 
           AUTHOR=$(gh pr view "$PR_NUMBER" \
             --json author -q '.author.login')
-          if [ "$AUTHOR" != "$REPO_OWNER" ]; then
-            echo "PR #$PR_NUMBER author '$AUTHOR' is not owner, skipping."
-            exit 0
+          HEAD_BRANCH=$(gh pr view "$PR_NUMBER" \
+            --json headRefName -q '.headRefName')
+
+          # ── Eligibility check ───────────────────────────────────────────
+          # Allowed:
+          #   1. Repo-owner PRs from the same repo (normal gitflow)
+          #   2. github-actions[bot] PRs on chore/release-* branches
+          #      (automated version-bump from release-publish workflow)
+
+          IS_OWNER_PR=false
+          IS_BOT_RELEASE=false
+
+          if [ "$AUTHOR" = "$REPO_OWNER" ]; then
+            HEAD_REPO=$(gh pr view "$PR_NUMBER" \
+              --json headRepositoryOwner \
+              -q '.headRepositoryOwner.login')
+            if [ "$HEAD_REPO" = "$REPO_OWNER" ]; then
+              IS_OWNER_PR=true
+            else
+              echo "PR #$PR_NUMBER from fork — skipping."
+              exit 0
+            fi
           fi
 
-          HEAD_REPO=$(gh pr view "$PR_NUMBER" \
-            --json headRepositoryOwner \
-            -q '.headRepositoryOwner.login')
-          if [ "$HEAD_REPO" != "$REPO_OWNER" ]; then
-            echo "PR #$PR_NUMBER comes from fork context, skipping."
+          if [ "$AUTHOR" = "github-actions[bot]" ]; then
+            case "$HEAD_BRANCH" in
+              chore/release-*)
+                IS_BOT_RELEASE=true
+                ;;
+            esac
+          fi
+
+          if [ "$IS_OWNER_PR" = "false" ] && \
+             [ "$IS_BOT_RELEASE" = "false" ]; then
+            echo "PR #$PR_NUMBER: '$AUTHOR' / '$HEAD_BRANCH' not eligible."
             exit 0
           fi
 
