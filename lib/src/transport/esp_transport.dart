@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Piergiorgio Vagnozzi
 // Licensed under the MIT License.
 
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter_esptool/src/models/esp_command.dart';
@@ -9,6 +10,12 @@ import 'package:flutter_esptool/src/models/esp_error.dart';
 import 'package:flutter_esptool/src/transport/esp_transport_interface.dart';
 import 'package:flutter_esptool/src/transport/slip_codec.dart';
 import 'package:platform_serial/platform_serial.dart';
+
+final _dbg = File('/tmp/esp_debug.log').openWrite(mode: FileMode.append);
+void _d(String msg) {
+  _dbg.writeln('${DateTime.now().toIso8601String()} $msg');
+  _dbg.flush();
+}
 
 /// Log event type emitted by [EspTransport].
 enum EspTransportLogType {
@@ -135,15 +142,60 @@ class EspTransport implements EspTransportInterface {
         await serial.setDtr(dtrState);
       }
 
-      // Classic reset (esptool ClassicReset).
-      await setDtr(false);
-      await setRts(true);
-      await Future<void>.delayed(const Duration(milliseconds: 100));
-      await setDtr(true);
-      await setRts(false);
-      await Future<void>.delayed(const Duration(milliseconds: 50));
-      await setDtr(false);
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      _d('[ESP] resetToBootloader mode=${_config?.resetMode}');
+      if (_config?.resetMode == EspResetMode.none) {
+        // No reset — device is assumed to already be in bootloader mode.
+        // Just flush buffers below and return.
+      } else if (_config?.resetMode == EspResetMode.usbJtag) {
+        // USB JTAG/Serial reset (esptool USBJTAGSerialReset).
+        // Used for ESP32-S2/S3/C3/C6/H2 chips with built-in USB peripheral
+        // (Espressif VID 0x303a).  After this sequence the USB device
+        // disconnects and re-enumerates — we close, wait, then reopen.
+        await setRts(false);
+        await setDtr(false); // Idle
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+        await setDtr(true); // Set IO0 low
+        await setRts(false);
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+        await setRts(true); // EN low — reset. Go through (1,1) not (0,0).
+        await setDtr(false);
+        await setRts(true); // Propagate RTS on Windows
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+        await setDtr(false);
+        await setRts(false); // Chip out of reset, IO0 high → bootloader
+
+        // The USB device disconnects during reset and re-enumerates as a
+        // bootloader. Close the port, wait for re-enumeration, then reopen.
+        final config = _config!;
+        _d('[ESP] USB JTAG: closing port for re-enum');
+        await serial.close();
+        _d('[ESP] USB JTAG: waiting 500ms for re-enum');
+        await Future<void>.delayed(const Duration(milliseconds: 500));
+        _d('[ESP] USB JTAG: reopening port ${config.portName}');
+        await serial.open(SerialConfig(
+          portName: config.portName,
+          baudRate: config.initialBaudRate,
+          dataBits: 8,
+          stopBits: SerialStopBits.one,
+          parity: SerialParity.none,
+          flowControl: SerialFlowControl.none,
+          readTimeout: config.timeout,
+          writeTimeout: config.timeout,
+        ));
+        _readBuffer.clear();
+        _d('[ESP] USB JTAG: port reopened OK');
+        return; // buffers already fresh — skip the flush/resetBuffers below
+      } else {
+        // Classic reset (esptool ClassicReset).
+        await setDtr(false);
+        await setRts(true);
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+        await setDtr(true);
+        await setRts(false);
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        await setDtr(false);
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+      }
     } on SerialError catch (error) {
       if (error.type != SerialErrorType.platformUnavailable) {
         rethrow;
@@ -153,7 +205,10 @@ class EspTransport implements EspTransportInterface {
         await Future<void>.delayed(const Duration(milliseconds: 40));
       }
     }
-    await serial.flush();
+    // Do NOT call serial.flush() here — on macOS it calls tcdrain() which
+    // blocks the isolate until all bytes drain at hardware level.  The DTR/RTS
+    // pin toggles above are fire-and-forget; there is nothing in the TX buffer
+    // that needs draining.
     // Flush the hardware receive buffer and the in-memory read buffer so
     // that boot-loader messages emitted during the reset pulse do not
     // contaminate the next SYNC attempt.
@@ -187,8 +242,14 @@ class EspTransport implements EspTransportInterface {
     );
 
     try {
+      _d('[ESP] write ${frame.length} bytes opcode=${command.opcode}: '
+          '${frame.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ')}');
       await serial.write(frame, timeout: effectiveTimeout);
-      await serial.flush();
+      _d('[ESP] write done');
+      // Do NOT call serial.flush() here — on macOS it calls tcdrain() which
+      // blocks the isolate until all bytes have been transmitted at the hardware
+      // level. Our non-blocking write already hands bytes to the kernel buffer;
+      // USB CDC/ACM flushes automatically at full USB bandwidth.
     } on SerialError catch (error, stackTrace) {
       final mapped = _mapSerialError(error, stackTrace);
       logger?.call(
@@ -324,6 +385,9 @@ class EspTransport implements EspTransportInterface {
           ),
         );
         _readBuffer.clear();
+        // Yield to the event loop so that a stream of bad frames does not
+        // spin-lock the UI isolate before the next serial read.
+        await Future<void>.delayed(Duration.zero);
         continue;
       }
       if (existing != null) {
@@ -338,26 +402,37 @@ class EspTransport implements EspTransportInterface {
       try {
         final available = await serial.bytesAvailable();
         final readLength = available > 0 ? available : 1;
+        _d('[ESP] read poll: available=$available readLength=$readLength '
+            'remaining=${remaining.inMilliseconds}ms bufLen=${_readBuffer.length}');
         final chunk = await serial.read(readLength, timeout: remaining);
         if (chunk.isNotEmpty) {
+          _d('[ESP] read got ${chunk.length} bytes: '
+              '${chunk.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ')}');
           _readBuffer.add(chunk);
         }
       } on SerialError catch (error, stackTrace) {
+        _d('[ESP] serial error type=${error.type} msg=${error.message}');
         if (error.type != SerialErrorType.timeout) {
           throw _mapSerialError(error, stackTrace);
         }
+        // A serial timeout means no data arrived yet.  Yield once so that a
+        // driver that returns timeout immediately does not spin-lock the isolate.
+        await Future<void>.delayed(Duration.zero);
       }
     }
 
     final trailing = _readBuffer.toBytes();
     _readBuffer.clear();
     if (trailing.isNotEmpty) {
+      _d('[ESP] partialPacket: ${trailing.length} bytes in buffer: '
+          '${trailing.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ')}');
       throw const EspError(
         type: EspErrorType.partialPacket,
         message: 'A complete SLIP frame was not received before timeout',
       );
     }
 
+    _d('[ESP] timeout: no bytes received');
     throw const EspError(
       type: EspErrorType.timeout,
       message: 'Timed out waiting for an ESP response',
@@ -408,10 +483,7 @@ class EspTransport implements EspTransportInterface {
         // a serial-read round-trip.
         return _tryExtractFrame();
       }
-      return _FrameReadResult(
-        rawFrame: rawFrame,
-        packet: frame,
-      );
+      return _FrameReadResult(rawFrame: rawFrame, packet: frame);
     }
 
     if (start > 0) {
@@ -475,10 +547,7 @@ class EspTransport implements EspTransportInterface {
 }
 
 class _FrameReadResult {
-  const _FrameReadResult({
-    required this.rawFrame,
-    required this.packet,
-  });
+  const _FrameReadResult({required this.rawFrame, required this.packet});
 
   final Uint8List rawFrame;
   final Uint8List packet;

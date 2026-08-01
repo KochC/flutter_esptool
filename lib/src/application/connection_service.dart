@@ -28,9 +28,10 @@ class ConnectionService {
       final syncTimeout = config.timeout;
 
       for (var attempt = 0; attempt < config.syncRetries; attempt++) {
-        if (attempt > 0) {
-          await _transport.resetToBootloader();
-        }
+        // Reset to bootloader before each attempt.
+        // EspResetMode.none is a no-op in resetToBootloader(), so this is
+        // safe to call unconditionally — the transport decides what to do.
+        await _transport.resetToBootloader();
         try {
           final response = await _transport.sendCommand(
             EspCommand(

@@ -3,12 +3,18 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:ffi' as ffi;
-import 'dart:io' show Platform;
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
 
 import '../models/serial_error.dart';
+
+final _dbg2 = File('/tmp/esp_debug.log').openWrite(mode: FileMode.append);
+void _dm(String msg) {
+  _dbg2.writeln('${DateTime.now().toIso8601String()} $msg');
+  _dbg2.flush();
+}
 
 /// macOS FFI implementation for enumerating and using serial ports.
 class MacOSSerialImpl {
@@ -124,45 +130,132 @@ class MacOSSerialImpl {
     }
   }
 
-  /// Reads data from the port using the natively configured timeout.
-  static Future<Uint8List> readData(String portName, int length) async {
+  /// Reads up to [length] bytes from the port.
+  ///
+  /// [timeoutMs] overrides the port's configured read timeout for this call.
+  /// If omitted, the port's configured [_MacOSPortState.readTimeoutMs] is used.
+  ///
+  /// Instead of passing the full timeout to the blocking C `read()` call
+  /// (which would stall the Dart isolate for the entire duration), this method
+  /// polls `bytesAvailable()` in a Dart async loop and only calls the native
+  /// `read()` when data is actually present — using timeout=0 so the C call
+  /// returns immediately.  Between polls it yields via [Future.delayed] so
+  /// the Flutter UI isolate stays fully responsive.
+  static Future<Uint8List> readData(
+    String portName,
+    int length, {
+    int? timeoutMs,
+  }) async {
     final state = _requirePort(portName);
-    final safeLength = length <= 0 ? 0 : length;
-    final buffer = calloc<ffi.Uint8>(safeLength == 0 ? 1 : safeLength);
+    if (length <= 0) return Uint8List(0);
 
-    try {
-      final bytesRead =
-          _bindings.read(state.handle, buffer, safeLength, state.readTimeoutMs);
-      if (bytesRead < 0) {
+    final handle = state.handle;
+    final deadlineMs = DateTime.now().millisecondsSinceEpoch +
+        (timeoutMs ?? state.readTimeoutMs);
+
+    while (true) {
+      // Check how many bytes are available without blocking.
+      final available = _bindings.bytesAvailable(handle);
+      if (available < 0) {
         throw _lastError('Error reading on macOS');
       }
-      if (bytesRead == 0) {
-        return Uint8List(0);
+
+      if (available > 0) {
+        // Data is ready — pass the remaining deadline as the native timeout.
+        // The native read() is now blocking (no O_NONBLOCK, VMIN=1) so it will
+        // wait up to timeout_ms for at least 1 byte to arrive in the tty buffer.
+        final remainingMs =
+            (deadlineMs - DateTime.now().millisecondsSinceEpoch).clamp(1, 5000);
+        final readLength = available < length ? available : length;
+        final buffer = calloc<ffi.Uint8>(readLength);
+        try {
+          final bytesRead =
+              _bindings.read(handle, buffer, readLength, remainingMs);
+          print(
+              '[MAC] native read: requested=$readLength got=$bytesRead available=$available');
+          if (bytesRead < 0) throw _lastError('Error reading on macOS');
+          if (bytesRead == 0) {
+            // Timed out inside native read — treat as no data yet.
+            continue;
+          }
+          final result = Uint8List.fromList(buffer.asTypedList(bytesRead));
+          print(
+              '[MAC] native bytes: ${result.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ')}');
+          return result;
+        } finally {
+          calloc.free(buffer);
+        }
       }
 
-      return Uint8List.fromList(buffer.asTypedList(bytesRead));
-    } finally {
-      calloc.free(buffer);
+      // No data yet — check deadline before yielding.
+      if (DateTime.now().millisecondsSinceEpoch >= deadlineMs) {
+        // Throw a proper timeout error so the caller (esp_transport._readFrame)
+        // can distinguish "no data yet" from a real read error and keep waiting
+        // up to its own (longer) deadline, rather than treating an empty return
+        // as a completed-but-empty read and potentially triggering partialPacket.
+        throw SerialError(
+          type: SerialErrorType.timeout,
+          message: 'Read timeout on macOS port $portName',
+        );
+      }
+
+      // Yield to the event loop for one frame (~1 ms) before polling again.
+      await Future<void>.delayed(const Duration(milliseconds: 1));
     }
   }
 
-  /// Writes data to the port using the natively configured timeout.
-  static Future<int> writeData(String portName, Uint8List data) async {
+  /// Writes [data] to the port without blocking the Dart isolate.
+  ///
+  /// Instead of passing the full write timeout to the blocking C `write()`
+  /// call, this method calls `write()` with `timeout=0` (non-blocking) in an
+  /// async loop, yielding via [Future.delayed] between attempts so the Flutter
+  /// UI isolate stays responsive.  On a serial port the kernel output buffer
+  /// is essentially always writable for small packets so the first call
+  /// typically writes all bytes immediately.
+  static Future<int> writeData(
+    String portName,
+    Uint8List data, {
+    int? timeoutMs,
+  }) async {
+    if (data.isEmpty) return 0;
     final state = _requirePort(portName);
-    final pointer = calloc<ffi.Uint8>(data.isEmpty ? 1 : data.length);
+    final handle = state.handle;
+    final effectiveTimeoutMs = timeoutMs ?? state.writeTimeoutMs;
+    final deadlineMs =
+        DateTime.now().millisecondsSinceEpoch + effectiveTimeoutMs;
 
+    final pointer = calloc<ffi.Uint8>(data.length);
     try {
       pointer.asTypedList(data.length).setAll(0, data);
-      final bytesWritten = _bindings.write(
-        state.handle,
-        pointer,
-        data.length,
-        state.writeTimeoutMs,
-      );
-      if (bytesWritten < 0) {
-        throw _lastError('Error writing on macOS');
+      var totalWritten = 0;
+
+      while (totalWritten < data.length) {
+        // Non-blocking write attempt (timeout=0): returns immediately if the
+        // kernel output buffer is not ready, or writes as many bytes as fit.
+        final bytesWritten = _bindings.write(
+          handle,
+          ffi.Pointer<ffi.Uint8>.fromAddress(
+            pointer.address + totalWritten,
+          ),
+          data.length - totalWritten,
+          0, // timeout=0 → non-blocking
+        );
+
+        if (bytesWritten < 0) {
+          throw _lastError('Error writing on macOS');
+        }
+        totalWritten += bytesWritten;
+
+        if (totalWritten >= data.length) break;
+
+        // Output buffer not ready yet — check deadline then yield.
+        if (DateTime.now().millisecondsSinceEpoch >= deadlineMs) {
+          throw _lastError('Write timeout on macOS');
+        }
+        await Future<void>.delayed(const Duration(milliseconds: 1));
       }
-      return bytesWritten;
+
+      return totalWritten;
     } finally {
       calloc.free(pointer);
     }
@@ -202,10 +295,8 @@ class MacOSSerialImpl {
     return state.ensureStream(
       bindings: _bindings,
       readData: (length) => readData(portName, length),
-      buildError: (message) => SerialError(
-        type: SerialErrorType.ioError,
-        message: message,
-      ),
+      buildError: (message) =>
+          SerialError(type: SerialErrorType.ioError, message: message),
     );
   }
 
@@ -263,8 +354,7 @@ class MacOSSerialImpl {
 }
 
 typedef _GetAvailablePortsJsonNative = ffi.Int32 Function(
-  ffi.Pointer<ffi.Pointer<Utf8>>,
-);
+    ffi.Pointer<ffi.Pointer<Utf8>>);
 typedef _OpenPortNative = ffi.IntPtr Function(
   ffi.Pointer<Utf8>,
   ffi.Int32,
@@ -298,40 +388,30 @@ typedef _FreeMemoryNative = ffi.Void Function(ffi.Pointer<ffi.Void>);
 class _MacOSSerialBindings {
   _MacOSSerialBindings._(ffi.DynamicLibrary library)
       : getAvailablePortsJson = library.lookupFunction<
-            _GetAvailablePortsJsonNative,
-            int Function(ffi.Pointer<ffi.Pointer<Utf8>>)>(
-          'serial_get_available_ports_json',
-        ),
+                _GetAvailablePortsJsonNative,
+                int Function(ffi.Pointer<ffi.Pointer<Utf8>>)>(
+            'serial_get_available_ports_json'),
         openPort = library.lookupFunction<
             _OpenPortNative,
-            int Function(
-              ffi.Pointer<Utf8>,
-              int,
-              int,
-              int,
-              int,
-              int,
-              int,
-              int,
-            )>('serial_open_port'),
+            int Function(ffi.Pointer<Utf8>, int, int, int, int, int, int,
+                int)>('serial_open_port'),
         closePort = library.lookupFunction<_ClosePortNative, int Function(int)>(
           'serial_close_port',
         ),
         read = library.lookupFunction<_ReadNative,
-            int Function(int, ffi.Pointer<ffi.Uint8>, int, int)>(
-          'serial_read',
-        ),
-        write = library.lookupFunction<_WriteNative,
-            int Function(int, ffi.Pointer<ffi.Uint8>, int, int)>(
-          'serial_write',
-        ),
+            int Function(int, ffi.Pointer<ffi.Uint8>, int, int)>('serial_read'),
+        write = library.lookupFunction<
+            _WriteNative,
+            int Function(
+                int, ffi.Pointer<ffi.Uint8>, int, int)>('serial_write'),
         bytesAvailable =
             library.lookupFunction<_HandleOnlyNative, int Function(int)>(
           'serial_bytes_available',
         ),
         waitReadable =
             library.lookupFunction<_WaitReadableNative, int Function(int, int)>(
-                'serial_wait_readable'),
+          'serial_wait_readable',
+        ),
         flush = library.lookupFunction<_HandleOnlyNative, int Function(int)>(
           'serial_flush',
         ),

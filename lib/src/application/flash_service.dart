@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Piergiorgio Vagnozzi
 // Licensed under the MIT License.
 
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:flutter_esptool/src/domain/flash/flash_parameters.dart';
@@ -47,14 +48,22 @@ class FlashService implements FlashServiceInterface {
         params.offset,
         blockSize,
       );
-      final dataBlocks = <Uint8List>[
-        for (final block in blocks)
-          params.compress
-              ? _compressOrThrow(block.data)
-              : Uint8List.fromList(block.data),
-      ];
-      final compressedTotalBytes =
-          dataBlocks.fold<int>(0, (total, block) => total + block.length);
+
+      // Compression (ZLibCodec) and block-copying are CPU-bound.  Offload to a
+      // helper isolate so the Flutter UI stays responsive during large writes.
+      final rawBlocks = blocks.map((b) => Uint8List.fromList(b.data)).toList();
+      final dataBlocks = params.compress
+          ? await Isolate.run(
+              () => rawBlocks.map((b) {
+                final result = ZlibHelper.compress(b);
+                return result.fold((v) => v, (e) => throw e);
+              }).toList(),
+            )
+          : rawBlocks;
+      final compressedTotalBytes = dataBlocks.fold<int>(
+        0,
+        (total, block) => total + block.length,
+      );
       final beginResponse = await _transport.sendCommand(
         EspCommand(
           opcode: params.compress
@@ -116,6 +125,9 @@ class FlashService implements FlashServiceInterface {
             message: 'Writing flash data',
           ),
         );
+        // Yield after each block so progress callbacks and UI frames are
+        // processed between serial round-trips.
+        await Future<void>.delayed(Duration.zero);
       }
 
       // Give the device a moment to settle after the last data block
@@ -145,7 +157,9 @@ class FlashService implements FlashServiceInterface {
         if (actualResult is Failure<String>) {
           return Failure<void>(actualResult.error);
         }
-        final expected = _md5Hex(params.data);
+        // MD5 over the full firmware image is CPU-bound; run off the UI isolate.
+        final data = params.data;
+        final expected = await Isolate.run(() => _md5HexStatic(data));
         final actual = (actualResult as Success<String>).value.toLowerCase();
         if (expected != actual) {
           return Failure<void>(
@@ -235,6 +249,8 @@ class FlashService implements FlashServiceInterface {
             message: 'Reading flash data',
           ),
         );
+        // Yield every chunk so the UI can render progress during long reads.
+        await Future<void>.delayed(Duration.zero);
       }
       return Success<Uint8List>(output.toBytes());
     } catch (error, stackTrace) {
@@ -305,8 +321,10 @@ class FlashService implements FlashServiceInterface {
         final data = ByteData.sublistView(payload);
         data.setUint32(0, offset, Endian.little);
         data.setUint32(4, size, Endian.little);
-        command =
-            EspCommand(opcode: EspCommandOpcode.eraseRegion, data: payload);
+        command = EspCommand(
+          opcode: EspCommandOpcode.eraseRegion,
+          data: payload,
+        );
         final seconds = (30 * (size / (1024 * 1024))).ceil().clamp(3, 120);
         timeout = Duration(seconds: seconds);
       } else {
@@ -438,11 +456,6 @@ class FlashService implements FlashServiceInterface {
     return header;
   }
 
-  Uint8List _compressOrThrow(Uint8List data) {
-    final result = ZlibHelper.compress(data);
-    return result.fold((value) => value, (error) => throw error);
-  }
-
   Uint8List _u32(int value) {
     final bytes = Uint8List(4);
     ByteData.sublistView(bytes).setUint32(0, value, Endian.little);
@@ -463,7 +476,9 @@ class FlashService implements FlashServiceInterface {
     callback?.call(progress);
   }
 
-  String _md5Hex(Uint8List data) {
+  /// Computes MD5 hex string for [data].  Static so it can be called from
+  /// [Isolate.run] (which requires top-level or static functions).
+  static String _md5HexStatic(Uint8List data) {
     final digest = _Md5().convert(data);
     final buffer = StringBuffer();
     for (final byte in digest) {
@@ -632,7 +647,10 @@ class _Md5 {
     buffer[input.length] = 0x80;
     final lengthData = ByteData.sublistView(buffer);
     lengthData.setUint32(
-        paddedLength - 8, bitLength & 0xFFFFFFFF, Endian.little);
+      paddedLength - 8,
+      bitLength & 0xFFFFFFFF,
+      Endian.little,
+    );
     lengthData.setUint32(paddedLength - 4, bitLength >> 32, Endian.little);
 
     var a0 = 0x67452301;
