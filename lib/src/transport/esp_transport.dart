@@ -172,7 +172,6 @@ class EspTransport implements EspTransportInterface {
           writeTimeout: config.timeout,
         ));
         _readBuffer.clear();
-        return;
         return; // buffers already fresh — skip the flush/resetBuffers below
       } else {
         // Classic reset (esptool ClassicReset).
