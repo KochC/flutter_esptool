@@ -8,7 +8,7 @@ assembly-versioning-scheme: MajorMinorPatch
 assembly-file-versioning-scheme: MajorMinorPatch
 mode: ContinuousDelivery
 commit-date-format: yyyy-MM-dd
-tag-prefix: '[vV]'
+tag-prefix: "[vV]"
 
 # ── Conventional-commit bump rules ──────────────────────────────────────────
 major-version-bump-message: >-
@@ -24,7 +24,7 @@ no-bump-message: >-
 branches:
   main:
     regex: ^main$
-    label: ''
+    label: ""
     is-main-branch: true
     increment: Patch
     prevent-increment:
@@ -35,13 +35,13 @@ branches:
     regex: ^stable$
     label: pre
     increment: Minor
-    source-branches: ['test']
+    source-branches: ["test"]
 
   test:
     regex: ^test$
     label: test
     increment: Minor
-    source-branches: ['dev']
+    source-branches: ["dev"]
 
   dev:
     regex: ^dev$
@@ -57,25 +57,25 @@ branches:
       - refactor
 
   feature:
-    regex: '^feat/.*'
+    regex: "^feat/.*"
     label: feat
     increment: Minor
-    source-branches: ['dev']
+    source-branches: ["dev"]
 
   fix:
-    regex: '^(fix|bugfix)/.*'
+    regex: "^(fix|bugfix)/.*"
     label: fix
     increment: Patch
-    source-branches: ['dev']
+    source-branches: ["dev"]
 
   hotfix:
-    regex: '^hotfix/.*'
+    regex: "^hotfix/.*"
     label: hotfix
     increment: Patch
-    source-branches: ['main', 'stable']
+    source-branches: ["main", "stable"]
 
   chore:
-    regex: '^(chore|docs|ci|refactor)/.*'
-    label: ''
+    regex: "^(chore|docs|ci|refactor)/.*"
+    label: ""
     increment: None
-    source-branches: ['dev', 'main']
+    source-branches: ["dev", "main"]
