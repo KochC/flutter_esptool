@@ -133,36 +133,6 @@ class InfoService {
       );
     }
   }
-      final data = (response as Success<Uint8List>).value;
-      if (data.length < 20) {
-        return Failure<EspSecurityInfo>(
-          EspError(
-            type: EspErrorType.commandFailed,
-            message: 'GET_SECURITY_INFO response too short: '
-                '${data.length} bytes (expected 20)',
-          ),
-        );
-      }
-      final bd = ByteData.sublistView(data);
-      return Success<EspSecurityInfo>(
-        EspSecurityInfo(
-          flags: bd.getUint32(0, Endian.little),
-          flashCryptCnt: data[4],
-          keyPurposes: data.sublist(5, 12).toList(),
-          chipId: bd.getUint32(12, Endian.little),
-          apiVersion: bd.getUint32(16, Endian.little),
-        ),
-      );
-    } catch (error, stackTrace) {
-      return Failure<EspSecurityInfo>(
-        EspError(
-          type: EspErrorType.commandFailed,
-          message: error.toString(),
-          stackTrace: stackTrace,
-        ),
-      );
-    }
-  }
 
   /// Returns the device MAC address.
   Future<Result<String>> getMac() async {
