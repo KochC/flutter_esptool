@@ -97,7 +97,7 @@ class InfoService {
       if (!response.isSuccess) {
         return Failure<EspSecurityInfo>(
           EspError(
-            type: EspErrorType.commandFailed,
+            type: EspErrorType.invalidResponse,
             message: 'GET_SECURITY_INFO failed: '
                 'status=${response.status} error=${response.error}',
           ),
@@ -107,7 +107,7 @@ class InfoService {
       if (data.length < 20) {
         return Failure<EspSecurityInfo>(
           EspError(
-            type: EspErrorType.commandFailed,
+            type: EspErrorType.invalidResponse,
             message: 'GET_SECURITY_INFO response too short: '
                 '${data.length} bytes (expected ≥20)',
           ),
@@ -126,7 +126,7 @@ class InfoService {
     } catch (error, stackTrace) {
       return Failure<EspSecurityInfo>(
         EspError(
-          type: EspErrorType.commandFailed,
+          type: EspErrorType.invalidResponse,
           message: error.toString(),
           stackTrace: stackTrace,
         ),
