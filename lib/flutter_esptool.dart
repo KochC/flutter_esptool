@@ -25,6 +25,7 @@ export 'package:flutter_esptool/src/models/esp_config.dart';
 export 'package:flutter_esptool/src/models/esp_error.dart';
 export 'package:flutter_esptool/src/models/esp_flash_info.dart';
 export 'package:flutter_esptool/src/models/esp_progress.dart';
+export 'package:flutter_esptool/src/models/esp_security_info.dart';
 export 'package:flutter_esptool/src/models/esp_result.dart';
 export 'package:flutter_esptool/src/resilience/esp_circuit_breaker.dart';
 export 'package:flutter_esptool/src/resilience/esp_resilient_transport.dart';
