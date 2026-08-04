@@ -6,6 +6,7 @@ library;
 
 export 'package:flutter_esptool/src/application/chip_detection_service.dart';
 export 'package:flutter_esptool/src/application/connection_service.dart';
+export 'package:flutter_esptool/src/application/efuse_service.dart';
 export 'package:flutter_esptool/src/application/flash_service.dart';
 export 'package:flutter_esptool/src/application/info_service.dart';
 export 'package:flutter_esptool/src/application/stub_loader_service.dart';
@@ -14,6 +15,7 @@ export 'package:flutter_esptool/src/domain/chip/chip_family.dart';
 export 'package:flutter_esptool/src/domain/flash/flash_parameters.dart';
 export 'package:flutter_esptool/src/domain/flash/flash_service_interface.dart';
 export 'package:flutter_esptool/src/domain/stub/stub_loader_interface.dart';
+export 'package:flutter_esptool/src/infrastructure/efuse/reed_solomon.dart';
 export 'package:flutter_esptool/src/infrastructure/flash_image/esp_image_header.dart';
 export 'package:flutter_esptool/src/infrastructure/flash_image/esp_image_parser.dart';
 export 'package:flutter_esptool/src/infrastructure/flash_image/flash_image_builder.dart';

@@ -286,6 +286,18 @@ int32_t ConfigurePort(
     }
   }
 
+  // Force the lowest possible read latency.  macOS's USB CDC/ACM driver
+  // otherwise coalesces the trailing partial USB packet of a burst into an
+  // internal latency buffer and only releases it after an (uncontrolled)
+  // timeout — which manifests as the final ~63-byte tail of a large flasher
+  // stub READ_FLASH frame going missing for seconds.  IOSSDATALAT sets the
+  // driver's data-latency timer in microseconds; a value of 1 makes the
+  // driver deliver bytes to the tty the instant they arrive.
+  unsigned long read_latency_us = 1;
+  if (ioctl(fd, IOSSDATALAT, &read_latency_us) != 0) {
+    // Non-fatal: not all drivers implement IOSSDATALAT.  Continue without it.
+  }
+
   if (tcflush(fd, TCIOFLUSH) != 0) {
     return SetErrnoError(errno, @"Unable to flush the serial port buffers");
   }

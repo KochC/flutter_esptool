@@ -107,6 +107,7 @@ class EspTransport implements EspTransportInterface {
       writeTimeout: config.timeout,
     );
 
+    _d('[ESP] open: calling serial.open ${config.portName}');
     await serial.open(serialConfig);
     await serial.resetBuffers();
     _readBuffer
@@ -295,6 +296,17 @@ class EspTransport implements EspTransportInterface {
     }
 
     try {
+      // Noise frames (complete SLIP frames that fail to parse as a response for
+      // the in-flight command) are set aside here rather than pushed straight
+      // back into _readBuffer.  Pushing them back mid-loop caused an infinite
+      // re-scan: _tryExtractFrame would re-extract the very same frame on the
+      // next iteration without ever reading new bytes from the wire, so the
+      // real response (arriving *after* the noise, e.g. a stub READ_FLASH MD5
+      // digest that leaked past the previous command) was never read and the
+      // command timed out.  On timeout we restore the noise so a subsequent
+      // readRaw() can still retrieve it (needed for stub OHAI detection); on a
+      // successful match we discard it as stale.
+      final setAsideNoise = <int>[];
       while (DateTime.now().isBefore(deadline)) {
         final remaining = deadline.difference(DateTime.now());
         if (remaining <= Duration.zero) {
@@ -317,13 +329,14 @@ class EspTransport implements EspTransportInterface {
             rethrow;
           }
           // A short frame that does not look like an ESP response may be the
-          // stub OHAI greeting (c0 4f 48 41 49 c0).  Push the raw frame back
-          // into _readBuffer so that a subsequent readRaw() call can retrieve
-          // it — this is critical for stub OHAI detection.
-          _d('[ESP] Noise frame (${responseFrame.packet.length}B), pushing raw '
-              'frame back to buffer: '
+          // stub OHAI greeting (c0 4f 48 41 49 c0).  Set the raw frame aside so
+          // that, if this command ultimately times out, it can be restored to
+          // _readBuffer for a subsequent readRaw() to retrieve — but do NOT
+          // push it back now, which would re-scan it forever.
+          _d('[ESP] Noise frame (${responseFrame.packet.length}B), setting raw '
+              'frame aside: '
               '${responseFrame.rawFrame.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ')}');
-          _readBuffer.add(responseFrame.rawFrame);
+          setAsideNoise.addAll(responseFrame.rawFrame);
           logger?.call(
             EspTransportLogEntry(
               type: EspTransportLogType.transportError,
@@ -332,8 +345,7 @@ class EspTransport implements EspTransportInterface {
               rawPacket: Uint8List.fromList(responseFrame.packet),
               rawFrame: Uint8List.fromList(responseFrame.rawFrame),
               command: command,
-              message:
-                  'Noise frame pushed back to buffer: ${parseError.message}',
+              message: 'Noise frame set aside: ${parseError.message}',
             ),
           );
           continue;
@@ -358,8 +370,17 @@ class EspTransport implements EspTransportInterface {
             'status=${response.status} error=${response.error}');
         if (response.opcode == command.opcode) {
           _d('[ESP] opcode matched — returning response');
+          // Discard any set-aside noise: it preceded the valid response and is
+          // stale (e.g. a leaked stub digest frame) — restoring it would poison
+          // the next command.
           return response;
         }
+      }
+
+      // Timed out without a matching response.  Restore any set-aside noise so
+      // that a subsequent readRaw() can still retrieve it (stub OHAI greeting).
+      if (setAsideNoise.isNotEmpty) {
+        _readBuffer.add(Uint8List.fromList(setAsideNoise));
       }
 
       throw const EspError(
@@ -391,10 +412,16 @@ class EspTransport implements EspTransportInterface {
     if (_readBuffer.length > 0) {
       final buffered = _readBuffer.toBytes();
       _readBuffer.clear();
-      result.addAll(buffered.take(count));
-      if (result.length >= count) {
-        return result.sublist(0, count);
+      if (buffered.length >= count) {
+        // Keep only the requested bytes and PRESERVE the remainder for the
+        // next read.  The previous implementation discarded everything beyond
+        // [count], silently dropping streamed data (e.g. stub READ_FLASH
+        // packets that piled into the buffer while an earlier sendCommand was
+        // still parsing its response frame).
+        _readBuffer.add(buffered.sublist(count));
+        return buffered.sublist(0, count);
       }
+      result.addAll(buffered);
     }
 
     while (result.length < count && DateTime.now().isBefore(deadline)) {
@@ -655,6 +682,28 @@ class EspTransport implements EspTransportInterface {
 
     final trailing = _readBuffer.toBytes();
     if (trailing.isNotEmpty) {
+      // Check whether the trailing bytes are all printable ASCII (0x09 TAB,
+      // 0x0A LF, 0x0D CR, or 0x20–0x7E printable).  If so, this is almost
+      // certainly the ESP32 ROM banner text that the chip emits on every reset:
+      //   "ESP-ROM:esp32s3-...\r\nBuild:...\r\nwaiting for download\r\n"
+      // There is no 0xC0 SLIP byte in this banner, so the SLIP framer can
+      // never complete a frame from it.  Clearing it and throwing a plain
+      // timeout (not partialPacket) avoids the misleading error log that
+      // flooded the console on every sync retry.
+      final isAllAscii = trailing.every(
+        (b) => b == 0x09 || b == 0x0A || b == 0x0D || (b >= 0x20 && b <= 0x7E),
+      );
+      if (isAllAscii) {
+        _d('[ESP] ROM banner noise discarded (${trailing.length} ASCII bytes): '
+            '"${String.fromCharCodes(trailing.where((b) => b >= 0x20 && b <= 0x7E))}"');
+        _readBuffer.clear();
+        throw const EspError(
+          type: EspErrorType.timeout,
+          message:
+              'Timed out waiting for an ESP response (ROM banner discarded)',
+        );
+      }
+
       // Do NOT clear _readBuffer here.  Any bytes that accumulated (e.g. the
       // stub OHAI greeting that arrives immediately after MEM_END) must survive
       // the timeout so that a subsequent readRaw() call can retrieve them.

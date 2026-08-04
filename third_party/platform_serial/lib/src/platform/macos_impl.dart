@@ -176,24 +176,60 @@ class MacOSSerialImpl {
         // framing because the caller accumulates bytes in _readBuffer and
         // extracts complete frames.
         const int nativeTimeoutMs = 50;
-        final readLength = available;
-        final buffer = calloc<ffi.Uint8>(readLength);
-        try {
-          final bytesRead =
-              _bindings.read(handle, buffer, readLength, nativeTimeoutMs);
-          _dm('[MAC] native read: requested=$readLength got=$bytesRead available=$available');
-          if (bytesRead < 0) throw _lastError('Error reading on macOS');
-          if (bytesRead == 0) {
-            // Timed out inside native read — yield and retry.
-            await Future<void>.delayed(const Duration(milliseconds: 1));
-            continue;
+        // Tight-drain the kernel tty buffer.  Returning to the Dart event loop
+        // after each single ::read incurs FFI + async overhead on every 63/64
+        // byte USB-CDC packet, which is too slow to keep pace with the flasher
+        // stub's READ_FLASH burst and lets the USB-CDC receive path drop bytes
+        // (observed: a systematic ~1 byte lost per 64-byte USB packet, causing
+        // multi-packet flash reads to come up short).  Draining in a tight
+        // synchronous loop pulls each packet the instant it lands.  Over-reading
+        // past a frame boundary is always safe: the caller reassembles by SLIP
+        // delimiters, so extra bytes are simply buffered for the next frame.
+        final collected = BytesBuilder(copy: false);
+        var avail = available;
+        // Cap the drain so a continuously-streaming port can never starve the
+        // event loop for an unbounded time.
+        const int maxDrainBytes = 1 << 16; // 64 KiB
+        while (avail > 0 && collected.length < maxDrainBytes) {
+          final readLength = avail;
+          final buffer = calloc<ffi.Uint8>(readLength);
+          try {
+            final bytesRead =
+                _bindings.read(handle, buffer, readLength, nativeTimeoutMs);
+            if (bytesRead < 0) throw _lastError('Error reading on macOS');
+            if (bytesRead == 0) {
+              // Native read timed out with nothing to give — stop draining and
+              // return whatever we have collected so far (if any).
+              break;
+            }
+            collected.add(Uint8List.fromList(buffer.asTypedList(bytesRead)));
+          } finally {
+            calloc.free(buffer);
           }
-          final result = Uint8List.fromList(buffer.asTypedList(bytesRead));
-          _dm('[MAC] native bytes: ${result.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ')}');
-          return result;
-        } finally {
-          calloc.free(buffer);
+
+          // Re-check the kernel buffer.  The tail byte of a 64-byte USB packet
+          // frequently lands a few microseconds after FIONREAD first reported
+          // the packet, so if the buffer momentarily drains to empty, spin a
+          // bounded number of times (no yield) to catch that straggler before
+          // giving up.  This is what closes the 1-byte-per-packet gap.
+          avail = _bindings.bytesAvailable(handle);
+          if (avail < 0) throw _lastError('Error reading on macOS');
+          if (avail == 0) {
+            for (var spin = 0; spin < 200 && avail == 0; spin++) {
+              avail = _bindings.bytesAvailable(handle);
+              if (avail < 0) throw _lastError('Error reading on macOS');
+            }
+          }
         }
+
+        if (collected.length > 0) {
+          final result = collected.toBytes();
+          _dm('[MAC] native drained: ${result.length} bytes (FIONREAD start=$available)');
+          return result;
+        }
+        // Native read timed out — yield and retry within the outer deadline.
+        await Future<void>.delayed(const Duration(milliseconds: 1));
+        continue;
       }
 
       // No data yet — check deadline before yielding.
