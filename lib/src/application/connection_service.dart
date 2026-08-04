@@ -28,9 +28,15 @@ class ConnectionService {
       final syncTimeout = config.timeout;
 
       for (var attempt = 0; attempt < config.syncRetries; attempt++) {
-        if (attempt > 0) {
-          await _transport.resetToBootloader();
-        }
+        // Reset to bootloader before each attempt.
+        // EspResetMode.none is a no-op in resetToBootloader(), so this is
+        // safe to call unconditionally — the transport decides what to do.
+        await _transport.resetToBootloader();
+        // Flush the RX buffer before sending SYNC to discard any ROM banner
+        // ASCII text that accumulated during the reset wait.  Without this,
+        // the banner bytes remain in _readBuffer and cause a spurious
+        // partialPacket error on every retry.
+        await _transport.flushRx();
         try {
           final response = await _transport.sendCommand(
             EspCommand(
