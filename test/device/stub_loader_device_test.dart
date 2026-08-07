@@ -7,22 +7,25 @@
 //   flutter test test/device/stub_loader_device_test.dart
 //
 // Prerequisites:
-//   - ESP32-S3 connected via USB JTAG/Serial to /dev/cu.usbmodem1101
+//   - ESP32-S3 connected via USB JTAG/Serial. The serial port defaults to
+//     /dev/cu.usbmodem1101 but can be overridden with the ESP_PORT env var:
+//       ESP_PORT=/dev/cu.usbmodem2101 flutter test test/device/stub_loader_device_test.dart
 //   - Device in ROM bootloader mode (hold BOOT, press EN, release BOOT)
 //     OR use the USB JTAG auto-reset (which the test does via EspResetMode.usbJtag)
 
 // ignore_for_file: avoid_print
 
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter_esptool/flutter_esptool.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-const _port = '/dev/cu.usbmodem1101';
+final _port = Platform.environment['ESP_PORT'] ?? '/dev/cu.usbmodem1101';
 
 void _espLogger(EspTransportLogEntry e) {
   final ts = e.timestamp.toIso8601String();
-  final hex = (Uint8List bytes) =>
+  String hex(Uint8List bytes) =>
       bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ');
   String msg;
   switch (e.type) {
@@ -48,9 +51,9 @@ void main() {
       // Connect via USB JTAG/Serial with auto-reset.
       print('\n[1/4] Connecting...');
       final connectResult = await connection.connect(
-        const EspConfig(
+        EspConfig(
           portName: _port,
-          timeout: Duration(seconds: 5),
+          timeout: const Duration(seconds: 5),
           syncRetries: 10,
           resetMode: EspResetMode.usbJtag,
         ),
@@ -60,7 +63,7 @@ void main() {
         connectResult.isSuccess,
         isTrue,
         reason: 'Connection failed: '
-            '${connectResult is Failure ? (connectResult as Failure).error.message : ""}',
+            '${connectResult is Failure ? connectResult.error.message : ""}',
       );
       print('[1/4] Connected OK');
 
@@ -80,7 +83,7 @@ void main() {
       final stubResult = await stubLoader.loadStub(ChipFamily.esp32s3);
 
       if (stubResult is Failure) {
-        print('[3/4] STUB FAILED: ${(stubResult as Failure).error.message}');
+        print('[3/4] STUB FAILED: ${stubResult.error.message}');
       } else {
         print('[3/4] STUB LOADED SUCCESSFULLY — OHAI received!');
       }
@@ -89,7 +92,7 @@ void main() {
         stubResult.isSuccess,
         isTrue,
         reason: stubResult is Failure
-            ? 'Stub load failed: ${(stubResult as Failure).error.message}'
+            ? 'Stub load failed: ${stubResult.error.message}'
             : '',
       );
       expect(stubLoader.isLoaded, isTrue);
@@ -127,9 +130,9 @@ void main() {
 
       print('\n[1/3] Connecting...');
       final connectResult = await connection.connect(
-        const EspConfig(
+        EspConfig(
           portName: _port,
-          timeout: Duration(seconds: 5),
+          timeout: const Duration(seconds: 5),
           syncRetries: 10,
           resetMode: EspResetMode.usbJtag,
         ),
@@ -142,7 +145,7 @@ void main() {
       final stubResult = await stubLoader.loadStub(ChipFamily.esp32s3);
       expect(stubResult.isSuccess, isTrue,
           reason: stubResult is Failure
-              ? (stubResult as Failure).error.message
+              ? stubResult.error.message
               : '');
       print('[2/3] Stub loaded');
 
@@ -158,7 +161,7 @@ void main() {
 
       expect(eraseResult.isSuccess, isTrue,
           reason: eraseResult is Failure
-              ? (eraseResult as Failure).error.message
+              ? eraseResult.error.message
               : '');
 
       print('\n=== FLASH ERASE VIA STUB SUCCESSFUL ===\n');
