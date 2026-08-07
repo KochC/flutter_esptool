@@ -50,6 +50,27 @@ class FlashService implements FlashServiceInterface {
   @override
   Future<Result<void>> writeFlash(FlashParameters params) async {
     try {
+      if (params.encrypted && _stubLoaded) {
+        return const Failure<void>(
+          EspError(
+            type: EspErrorType.flashWriteFailed,
+            message: 'Encrypted flash writes are only supported in ROM-'
+                'loader mode (no flasher stub); the stub does not '
+                'implement on-the-fly encryption.',
+          ),
+        );
+      }
+      if (params.encrypted && params.compress) {
+        return const Failure<void>(
+          EspError(
+            type: EspErrorType.flashWriteFailed,
+            message: 'Encrypted and compressed flash writes cannot be '
+                'combined — the ROM cannot decompress and encrypt a block '
+                'in the same pass.',
+          ),
+        );
+      }
+
       // The ESP ROM requires SPI_ATTACH (0x0D) before any flash write
       // commands.  Without this step the ROM does not know how the SPI flash
       // is wired and silently ignores FLASH_BEGIN.
@@ -213,6 +234,7 @@ class FlashService implements FlashServiceInterface {
                 totalBytes: paddedData.length,
                 blockCount: blocks.length,
                 offset: params.offset,
+                encrypted: params.encrypted,
               ),
       ),
     );
@@ -937,6 +959,7 @@ class FlashService implements FlashServiceInterface {
     required int totalBytes,
     required int blockCount,
     required int offset,
+    bool encrypted = false,
   }) {
     // FLASH_BEGIN payload format differs between ROM and stub:
     //
@@ -945,7 +968,9 @@ class FlashService implements FlashServiceInterface {
     //   [4]  num_blocks  (uint32 LE)
     //   [8]  block_size  (uint32 LE)
     //   [12] offset      (uint32 LE)
-    //   [16] encrypted   (uint32 LE, 0 = not encrypted)
+    //   [16] encrypted   (uint32 LE, 0 = not encrypted, 1 = ROM encrypts
+    //        each block on-the-fly with the burned flash-encryption key
+    //        before writing — equivalent to esptool.py's `--encrypt`).
     // Sending only 16 bytes in ROM mode causes subsequent FLASH_DATA to be
     // rejected with ROM_INVALID_RECV_MSG (status=1, error=5).
     //
@@ -956,7 +981,8 @@ class FlashService implements FlashServiceInterface {
     //   [12] offset      (uint32 LE)
     // The stub ignores any extra bytes but rejects a 20-byte payload as
     // malformed (status=1, error=0) because it counts the payload length
-    // to determine the encrypted flag.
+    // to determine the encrypted flag. [encrypted] MUST be false here —
+    // callers are responsible for guarding this (see [writeFlash]).
     final payloadLen = _stubLoaded ? 16 : 20;
     final payload = Uint8List(payloadLen);
     final data = ByteData.sublistView(payload);
@@ -965,7 +991,7 @@ class FlashService implements FlashServiceInterface {
     data.setUint32(8, blockSize, Endian.little);
     data.setUint32(12, offset, Endian.little);
     if (!_stubLoaded) {
-      data.setUint32(16, 0, Endian.little); // encrypted = 0 (ROM only)
+      data.setUint32(16, encrypted ? 1 : 0, Endian.little);
     }
     return payload;
   }
