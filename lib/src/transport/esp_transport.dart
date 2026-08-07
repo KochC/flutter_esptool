@@ -9,7 +9,6 @@ import 'package:flutter_esptool/src/models/esp_error.dart';
 import 'package:flutter_esptool/src/transport/esp_transport_interface.dart';
 import 'package:flutter_esptool/src/transport/slip_codec.dart';
 import 'package:platform_serial/platform_serial.dart';
-import 'package:platform_serial/src/direct_serial_port.dart';
 
 void _d(String msg) {
   // ignore: avoid_print
@@ -847,7 +846,7 @@ class EspTransport implements EspTransportInterface {
     }
 
     final opcodeValue = data.getUint8(1);
-    var opcode = EspCommandOpcodeParsing.fromValue(opcodeValue);
+    final opcode = EspCommandOpcodeParsing.fromValue(opcodeValue);
     if (opcode == null) {
       // The ROM bootloader sends opcode=0x00 for unsupported/unknown commands
       // (e.g. eraseFlash 0xD0 which is stub-only).  Rather than discarding the

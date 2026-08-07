@@ -550,8 +550,8 @@ void main() {
           portName: 'COM1', timeout: Duration(milliseconds: 1)));
       await expectLater(
           noiseOnly.sendCommand(EspCommand(opcode: EspCommandOpcode.sync)),
-          throwsA(isA<EspError>()
-              .having((error) => error.type, 'type', EspErrorType.timeout)));
+          throwsA(isA<EspError>().having(
+              (error) => error.type, 'type', EspErrorType.partialPacket)));
 
       final frameWithRemaining = EspTransport(
         serial: _Serial(responses: <Uint8List>[

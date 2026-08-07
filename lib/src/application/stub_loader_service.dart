@@ -10,7 +10,6 @@ import 'package:flutter_esptool/src/models/esp_command.dart';
 import 'package:flutter_esptool/src/models/esp_error.dart';
 import 'package:flutter_esptool/src/models/esp_result.dart';
 import 'package:flutter_esptool/src/transport/esp_transport_interface.dart';
-import 'package:flutter_esptool/src/transport/slip_codec.dart';
 
 void _d(String msg) {
   // ignore: avoid_print
@@ -538,21 +537,5 @@ class StubLoaderService implements StubLoaderInterface {
     }
 
     return const Success<void>(null);
-  }
-
-  /// Builds a SLIP-encoded ESP packet without sending it.
-  List<int> _buildSlipPacket({
-    required EspCommandOpcode opcode,
-    required Uint8List data,
-    required int checksum,
-  }) {
-    final packet = Uint8List(8 + data.length);
-    final bd = ByteData.sublistView(packet);
-    bd.setUint8(0, 0x00);
-    bd.setUint8(1, opcode.value);
-    bd.setUint16(2, data.length, Endian.little);
-    bd.setUint32(4, checksum, Endian.little);
-    packet.setRange(8, packet.length, data);
-    return SlipCodec.encode(packet);
   }
 }
