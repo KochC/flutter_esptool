@@ -3,8 +3,10 @@
 
 import 'dart:typed_data';
 
-import 'package:flutter_esptool/src/application/efuse_service.dart';
+import 'package:flutter_esptool/flutter_esptool.dart';
 import 'package:flutter_test/flutter_test.dart';
+
+import '../support/fake_transport.dart';
 
 void main() {
   group('EfuseService.keyBlockWords', () {
@@ -63,6 +65,200 @@ void main() {
       expect(EfuseService.keyPurposeSecureBootDigest0, 9);
       expect(EfuseService.blockKey0, 4);
       expect(EfuseService.blockKey1, 5);
+    });
+  });
+
+  group('EfuseService – transport-backed operations', () {
+    final digest = Uint8List.fromList(List<int>.generate(32, (i) => i));
+
+    test('burnSecureBootKeyDigest programs BLOCK_KEY1 then BLOCK0', () async {
+      final transport = FakeTransport(); // all reads return 0 → idle
+      final service = EfuseService(transport: transport);
+
+      final result = await service.burnSecureBootKeyDigest(digest);
+
+      expect(result.isSuccess, isTrue);
+      // Two _programBlock passes issue many WRITE_REG commands.
+      final writes = transport.sentCommands
+          .where((c) => c.opcode == EspCommandOpcode.writeReg)
+          .length;
+      expect(writes, greaterThan(20));
+    });
+
+    test('burnSecureBootKeyDigest rejects a non-32-byte digest', () async {
+      final service = EfuseService(transport: FakeTransport());
+      final result = await service.burnSecureBootKeyDigest(Uint8List(16));
+      expect(result.isFailure, isTrue);
+      expect(
+        (result as Failure<void>).error.type,
+        EspErrorType.unsupportedOperation,
+      );
+    });
+
+    test('burnSecureBootKeyDigest surfaces a transport failure', () async {
+      final transport = FakeTransport(failOpcodes: {EspCommandOpcode.writeReg});
+      final service = EfuseService(transport: transport);
+      final result = await service.burnSecureBootKeyDigest(digest);
+      expect(result.isFailure, isTrue);
+      expect(
+        (result as Failure<void>).error.type,
+        EspErrorType.invalidResponse,
+      );
+    });
+
+    test('enableSecureBoot burns SECURE_BOOT_EN', () async {
+      final transport = FakeTransport();
+      final service = EfuseService(transport: transport);
+      final result = await service.enableSecureBoot();
+      expect(result.isSuccess, isTrue);
+      expect(
+        transport.sentCommands
+            .any((c) => c.opcode == EspCommandOpcode.writeReg),
+        isTrue,
+      );
+    });
+
+    test('enableSecureBoot reports a write failure', () async {
+      final service = EfuseService(
+        transport: FakeTransport(failOpcodes: {EspCommandOpcode.writeReg}),
+      );
+      expect((await service.enableSecureBoot()).isFailure, isTrue);
+    });
+
+    test('burnFlashEncryptionKeyData validates key length', () async {
+      final service = EfuseService(transport: FakeTransport());
+      expect(
+        (await service.burnFlashEncryptionKeyData(Uint8List(10))).isFailure,
+        isTrue,
+      );
+      expect(
+        (await service.burnFlashEncryptionKeyData(digest)).isSuccess,
+        isTrue,
+      );
+    });
+
+    test('lockFlashEncryptionKey with and without read protection', () async {
+      final service = EfuseService(transport: FakeTransport());
+      expect((await service.lockFlashEncryptionKey()).isSuccess, isTrue);
+      expect(
+        (await service.lockFlashEncryptionKey(readProtect: false)).isSuccess,
+        isTrue,
+      );
+    });
+
+    test('lockFlashEncryptionKey reports a write failure', () async {
+      final service = EfuseService(
+        transport: FakeTransport(failOpcodes: {EspCommandOpcode.writeReg}),
+      );
+      expect((await service.lockFlashEncryptionKey()).isFailure, isTrue);
+    });
+
+    test('readSecureBootKeyDigest reconstructs 32 bytes from 8 words', () async {
+      // 8 words, each 0x03020100 + i pattern → predictable little-endian bytes.
+      final words = List<int>.generate(8, (i) => 0x04030201 * (i + 1) & 0xFFFFFFFF);
+      final transport = FakeTransport(readRegValues: words);
+      final service = EfuseService(transport: transport);
+
+      final result = await service.readSecureBootKeyDigest();
+      expect(result.isSuccess, isTrue);
+      final bytes = (result as Success<Uint8List>).value;
+      expect(bytes.length, 32);
+      // First word 0x04030201 → little-endian bytes 01 02 03 04.
+      expect(bytes.sublist(0, 4), <int>[0x01, 0x02, 0x03, 0x04]);
+    });
+
+    test('readSecureBootKeyDigest reports a read failure', () async {
+      final service = EfuseService(
+        transport: FakeTransport(failOpcodes: {EspCommandOpcode.readReg}),
+      );
+      expect((await service.readSecureBootKeyDigest()).isFailure, isTrue);
+    });
+
+    test('readFlashEncryptionKey returns 32 bytes', () async {
+      final service = EfuseService(
+        transport: FakeTransport(readRegValues: List<int>.filled(8, 0xDEADBEEF)),
+      );
+      final result = await service.readFlashEncryptionKey();
+      expect((result as Success<Uint8List>).value.length, 32);
+    });
+
+    test('readFlashEncryptionKey reports a read failure', () async {
+      final service = EfuseService(
+        transport: FakeTransport(failOpcodes: {EspCommandOpcode.readReg}),
+      );
+      expect((await service.readFlashEncryptionKey()).isFailure, isTrue);
+    });
+
+    test('readProvisioningState decodes BLOCK0 fields', () async {
+      // Command-register reads (for _waitEfuseIdle) must be 0 (idle). The four
+      // provisioning reads happen after; use onCommand to shape them precisely.
+      var readCount = 0;
+      final transport = FakeTransport(
+        onCommand: (command) {
+          if (command.opcode == EspCommandOpcode.writeReg) {
+            return okResponse(command.opcode);
+          }
+          // readReg
+          readCount++;
+          // The read sequence during readProvisioningState:
+          //   _triggerEfuseRead → _waitEfuseIdle reads cmd (idle=0)
+          //   then w0,w1,w2,w3.
+          // Return 0 for idle polls; shape the last 4 as provisioning words.
+          // Simplest: encode via value based on the register address.
+          final addr = ByteData.sublistView(command.data).getUint32(0, Endian.little);
+          const rdBlock0Base = 0x60007000 + 0x02C;
+          if (addr == rdBlock0Base) {
+            return okResponse(command.opcode, value: (1 << 23) | (1 << 8));
+          } else if (addr == rdBlock0Base + 4) {
+            return okResponse(command.opcode, value: 0x01);
+          } else if (addr == rdBlock0Base + 8) {
+            return okResponse(command.opcode,
+                value: (4 << 24) | (9 << 28) | (1 << 18));
+          } else if (addr == rdBlock0Base + 12) {
+            return okResponse(command.opcode, value: 1 << 20);
+          }
+          return okResponse(command.opcode); // idle poll = 0
+        },
+      );
+      final service = EfuseService(transport: transport);
+
+      final result = await service.readProvisioningState();
+      expect(result.isSuccess, isTrue);
+      final state = (result as Success<EfuseProvisioningState>).value;
+      expect(state.keyPurpose0, 4);
+      expect(state.keyPurpose1, 9);
+      expect(state.flashKeyPurposeSet, isTrue);
+      expect(state.flashKeyWriteProtected, isTrue);
+      expect(state.flashKeyReadProtected, isTrue);
+      expect(state.flashKeyLocked, isTrue);
+      expect(state.digestBurned, isTrue);
+      expect(state.secureBootEnabled, isTrue);
+      expect(state.flashEncryptionActive, isTrue); // cryptCnt=1 → odd
+      expect(readCount, greaterThan(4));
+      expect(state.toString(), contains('keyPurpose0=4'));
+    });
+
+    test('readProvisioningState reports a read failure', () async {
+      final service = EfuseService(
+        transport: FakeTransport(failOpcodes: {EspCommandOpcode.readReg}),
+      );
+      expect((await service.readProvisioningState()).isFailure, isTrue);
+    });
+
+    test('_waitEfuseIdle times out when controller never goes idle', () async {
+      // cmd register always reports a pending bit → wait loop exhausts and the
+      // operation fails.
+      final transport = FakeTransport(
+        onCommand: (command) {
+          if (command.opcode == EspCommandOpcode.readReg) {
+            return okResponse(command.opcode, value: 0x2); // PGM pending forever
+          }
+          return okResponse(command.opcode);
+        },
+      );
+      final service = EfuseService(transport: transport);
+      final result = await service.enableSecureBoot();
+      expect(result.isFailure, isTrue);
     });
   });
 }
