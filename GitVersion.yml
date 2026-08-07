@@ -1,23 +1,81 @@
+###############################################################################
+# GitVersion configuration for flutter_esptool
+# Gitflow: feat/* | fix/* | hotfix/* | chore/* → dev → test → stable → main
+# Versions on main are clean SemVer (0.1.5); branches get pre-release labels.
+###############################################################################
+
+assembly-versioning-scheme: MajorMinorPatch
+assembly-file-versioning-scheme: MajorMinorPatch
 mode: ContinuousDelivery
-next-version: 0.1.1
+commit-date-format: yyyy-MM-dd
+tag-prefix: "[vV]"
+
+# ── Conventional-commit bump rules ──────────────────────────────────────────
+major-version-bump-message: >-
+  ^(feat|fix|refactor|perf|build|chore|test|docs|style|ci)(\(.+\))?!:.*
+  |^BREAKING[- ]CHANGE:.*
+minor-version-bump-message: '^feat(\(.+\))?:'
+patch-version-bump-message: >-
+  ^(fix|refactor|perf|docs|style|test|build|ci|chore)(\(.+\))?:
+no-bump-message: >-
+  ^\[skip bump\]|^Merge branch|^chore: bump version
+
+# ── Branch strategies ────────────────────────────────────────────────────────
 branches:
   main:
     regex: ^main$
-    increment: Patch
+    label: ""
     is-main-branch: true
-  develop:
-    regex: ^develop$
+    increment: Patch
+    prevent-increment:
+      when-branch-merged: true
+      of-merged-branch-version: false
+
+  stable:
+    regex: ^stable$
+    label: pre
     increment: Minor
-    track-merge-target: true
+    source-branches: ["test"]
+
+  test:
+    regex: ^test$
+    label: test
+    increment: Minor
+    source-branches: ["dev"]
+
+  dev:
+    regex: ^dev$
+    label: dev
+    increment: Minor
+    source-branches:
+      - feat
+      - fix
+      - hotfix
+      - chore
+      - docs
+      - ci
+      - refactor
+
   feature:
-    regex: ^features?[/-]
-    increment: Inherit
-  release:
-    regex: ^releases?[/-]
+    regex: "^feat/.*"
+    label: feat
+    increment: Minor
+    source-branches: ["dev"]
+
+  fix:
+    regex: "^(fix|bugfix)/.*"
+    label: fix
     increment: Patch
-    is-release-branch: true
+    source-branches: ["dev"]
+
   hotfix:
-    regex: ^hotfix(es)?[/-]
+    regex: "^hotfix/.*"
+    label: hotfix
     increment: Patch
-ignore:
-  sha: []
+    source-branches: ["main", "stable"]
+
+  chore:
+    regex: "^(chore|docs|ci|refactor)/.*"
+    label: ""
+    increment: None
+    source-branches: ["dev", "main"]

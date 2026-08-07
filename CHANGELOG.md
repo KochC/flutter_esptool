@@ -1,3 +1,20 @@
+## 0.1.5
+
+- Fixed blocking FFI serial reads: moved CPU-bound serial I/O off the UI
+  isolate to prevent frame drops on Windows and macOS.
+- Removed debug-only file logging (`/tmp/esp_debug.log`) from
+  `EspTransport` that caused `PathNotFoundException` on Windows and
+  `StreamSink` state errors in multi-test suites.
+- Configured GitVersion (`GitVersion.yml`) for automatic semantic
+  versioning with conventional-commit bump rules across the full
+  gitflow pipeline (feat/fix/hotfix → dev → test → stable → main).
+- Rewrote release workflow with GitVersion integration: version is now
+  computed automatically from git history on every merge to `main`,
+  `pubspec.yaml` is patched in CI, and a version-bump PR is opened
+  automatically to keep the repository in sync.
+- Extended auto-approve/merge workflow to handle bot-opened
+  version-bump PRs (`chore/release-*`) without manual intervention.
+
 ## 0.1.4
 
 - Added `topics` to `pubspec.yaml` for pub.dev discoverability
