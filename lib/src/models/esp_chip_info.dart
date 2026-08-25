@@ -18,6 +18,9 @@ enum ChipFamily {
   /// The Espressif ESP32-C3 SoC.
   esp32c3,
 
+  /// The Espressif ESP32-C6 SoC.
+  esp32c6,
+
   /// An unrecognised or unsupported chip.
   unknown,
 }

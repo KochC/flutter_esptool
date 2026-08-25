@@ -94,6 +94,13 @@ void main() {
       expect(ChipFamilyResolver.describe(ChipFamily.unknown),
           'Unknown ESP device');
     });
+
+    test('chip family resolver detects ESP32-C6 by its ROM magic', () {
+      // ESP32-C6 CHIP_DETECT_MAGIC_VALUE (esptool ESP32C6ROM).
+      expect(ChipFamilyResolver.resolve(0x2CE0806F), ChipFamily.esp32c6);
+      expect(
+          ChipFamilyResolver.describe(ChipFamily.esp32c6), 'ESP32-C6');
+    });
   });
 
   group('flash image and partition coverage', () {
