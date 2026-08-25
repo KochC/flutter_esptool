@@ -598,15 +598,26 @@ intptr_t serial_open_port(
     return 0;
   }
 
-  // Open without O_NONBLOCK so that blocking reads work correctly on USB
-  // CDC/ACM ports. On macOS, FIONREAD/kqueue report bytes ready before the
-  // USB packet lands in the tty buffer; O_NONBLOCK causes ::read() to return
-  // EAGAIN (0 bytes) even when data is available. We use select()/kevent() to
-  // wait for readability with our own timeout, then block in ::read().
-  const int fd = ::open(port_name, O_RDWR | O_NOCTTY | O_CLOEXEC);
+  // Open with O_NONBLOCK so the open() call does NOT block waiting for carrier
+  // detect (DCD). On the ESP32-S2 native USB-CDC (and other USB-CDC/ACM ports),
+  // a blocking open() can stall for ~60 s after the device re-enumerates until
+  // DCD asserts. Once the fd is open we CLEAR O_NONBLOCK (fcntl F_SETFL) so that
+  // blocking reads still work correctly — the reason the original code avoided
+  // O_NONBLOCK: on macOS, FIONREAD/kqueue report bytes ready before the USB
+  // packet lands in the tty buffer, so an O_NONBLOCK ::read() returns EAGAIN
+  // even when data is available. We use select()/kevent() to wait for
+  // readability with our own timeout, then block in ::read().
+  const int fd = ::open(port_name, O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
   if (fd == -1) {
     SetErrnoError(errno, @"Unable to open the serial port");
     return 0;
+  }
+
+  // Clear O_NONBLOCK now that the port is open (restore blocking semantics for
+  // ::read()). Keep O_CLOEXEC etc. by fetching and masking, not overwriting.
+  const int fl = ::fcntl(fd, F_GETFL, 0);
+  if (fl != -1) {
+    ::fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
   }
 
   if (ioctl(fd, TIOCEXCL) != 0 && errno != ENOTTY) {

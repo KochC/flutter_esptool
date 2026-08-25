@@ -15,6 +15,7 @@ class FlashParameters {
     this.verify = false,
     this.eraseAll = false,
     this.encrypted = false,
+    this.leaveInDownloadMode = false,
     this.onProgress,
   });
 
@@ -29,6 +30,15 @@ class FlashParameters {
 
   /// Whether to verify the written bytes.
   final bool verify;
+
+  /// When true, FLASH_END keeps the chip in download mode (data=1) even without
+  /// a flasher stub, instead of the default ROM behaviour (data=0 = reboot).
+  ///
+  /// Use this to write several regions back-to-back on the SAME live
+  /// connection without a reboot/re-enumeration between them — important on the
+  /// ESP32-S2 native USB-CDC, where a reboot re-enumerates the USB device and
+  /// stalls the next command. Set it for every write except the last.
+  final bool leaveInDownloadMode;
 
   /// Whether to request a full-chip erase.
   final bool eraseAll;

@@ -11,6 +11,14 @@ enum EspResetMode {
   /// USB Serial/JTAG peripheral interprets as a bootloader-entry request.
   usbJtag,
 
+  /// ESP32-S2 native USB-OTG (CDC/ACM) reset. The S2 has NO USB-Serial/JTAG
+  /// peripheral: it uses the **classic** DTR/RTS pin sequence to drive EN/IO0,
+  /// BUT — like the JTAG chips — the device re-enumerates when it reboots into
+  /// the ROM USB-CDC bootloader, so the port must be closed, given time to
+  /// re-enumerate, then reopened (unlike a plain UART-bridge classic reset,
+  /// where the same USB device persists).
+  usbOtg,
+
   /// Skip the hardware reset entirely — assume the chip is already in ROM
   /// bootloader mode.  Use this for ESP32-S3 USB JTAG devices that are
   /// already awaiting SYNC (e.g. freshly powered or manually held in boot).

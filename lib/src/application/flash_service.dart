@@ -39,6 +39,19 @@ class FlashService implements FlashServiceInterface {
 
   bool get _stubLoaded => _stubLoader?.isLoaded ?? false;
 
+  /// Whether SPI_ATTACH (0x0D) has already been sent on the current connection.
+  /// In ROM mode SPI_ATTACH must be sent ONCE before flash writes; sending it
+  /// again after a FLASH_END(1) (stay-in-download) — e.g. when writing several
+  /// regions back-to-back on one live connection — makes the ESP32-S2 ROM stop
+  /// responding. Reset via [resetSpiAttachState] whenever the connection is
+  /// re-established (reset/reconnect).
+  bool _spiAttached = false;
+
+  /// Clears the cached SPI_ATTACH state so the next write re-attaches. Call
+  /// after any reset/reconnect that puts the chip back in a fresh ROM state.
+  void resetSpiAttachState() => _spiAttached = false;
+
+
   /// The flash block size used for chunked writes.
   final int blockSize;
 
@@ -77,7 +90,11 @@ class FlashService implements FlashServiceInterface {
       //
       // When the flasher stub is loaded, SPI_ATTACH is NOT sent: the stub
       // already owns the SPI peripheral and rejects ROM-mode setup opcodes.
-      if (!_stubLoaded) {
+      //
+      // It is also sent only ONCE per connection: re-sending SPI_ATTACH after a
+      // FLASH_END(1) (writing several regions back-to-back on one live
+      // connection) makes the ESP32-S2 ROM stop responding. See [_spiAttached].
+      if (!_stubLoaded && !_spiAttached) {
         final attachResponse = await _transport.sendCommand(
           EspCommand(opcode: EspCommandOpcode.spiAttach, data: Uint8List(8)),
         );
@@ -89,6 +106,7 @@ class FlashService implements FlashServiceInterface {
             ),
           );
         }
+        _spiAttached = true;
       }
 
       final paddedData = FlashImageBuilder.buildPaddedImage(
@@ -298,6 +316,22 @@ class FlashService implements FlashServiceInterface {
 
     // Give the device a moment to settle after the last data block
     await Future<void>.delayed(const Duration(milliseconds: 200));
+
+    // FLASH_END terminates the current flash session.
+    //
+    //   • With the stub, or a single ROM write, we send it (data=1 stays in
+    //     download mode, data=0 reboots — see below).
+    //   • For multi-region ROM provisioning (leaveInDownloadMode), we SKIP
+    //     FLASH_END between regions entirely: the next region's FLASH_BEGIN
+    //     implicitly finalises the previous write, and — critically on the
+    //     ESP32-S2 ROM — issuing a FLASH_END(1) and then a new FLASH_BEGIN on
+    //     the same connection makes the S2 stop responding. Skipping FLASH_END
+    //     keeps the ROM in a state where the next FLASH_BEGIN succeeds. The
+    //     caller sends a final FLASH_END(0) (reboot) after the LAST region by
+    //     leaving leaveInDownloadMode false on that write.
+    if (params.leaveInDownloadMode && !_stubLoaded) {
+      return null;
+    }
 
     // FLASH_END / FLASH_DEFL_END data field:
     //   0 = run user code (reboot out of download mode) — ROM mode behaviour

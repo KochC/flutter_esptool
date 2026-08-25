@@ -230,6 +230,56 @@ class EspTransport implements EspTransportInterface {
         _readBuffer.clear();
         _d('[ESP] USB JTAG: port reopened OK');
         return; // buffers flushed — skip the generic flush/resetBuffers below
+      } else if (_config?.resetMode == EspResetMode.usbOtg) {
+        // ESP32-S2 native USB-OTG (CDC/ACM) reset. Use the CLASSIC DTR/RTS pin
+        // sequence (the S2 has no USB-Serial/JTAG peripheral), then — because
+        // the S2 re-enumerates as its ROM USB-CDC bootloader when it reboots —
+        // close, wait for re-enumeration, and reopen (like the JTAG path).
+        await setDtr(false);
+        await setRts(true); // EN low → reset asserted
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+        await setDtr(true); // IO0 low → request download mode
+        await setRts(false); // EN high → out of reset while IO0 held low
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        await setDtr(false); // release IO0
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+
+        final config = _config!;
+        _d('[ESP] USB OTG (S2): closing port for re-enum');
+        await serial.close();
+        _d('[ESP] USB OTG (S2): waiting 2000ms for re-enum');
+        await Future<void>.delayed(const Duration(milliseconds: 2000));
+        final serialConfig = SerialConfig(
+          portName: config.portName,
+          baudRate: config.initialBaudRate,
+          dataBits: 8,
+          stopBits: SerialStopBits.one,
+          parity: SerialParity.none,
+          flowControl: SerialFlowControl.none,
+          readTimeout: config.timeout,
+          writeTimeout: config.timeout,
+        );
+        SerialError? lastError;
+        for (var attempt = 0; attempt < 15; attempt++) {
+          try {
+            _d('[ESP] USB OTG (S2): reopening port ${config.portName} attempt=${attempt + 1}');
+            await serial.open(serialConfig);
+            lastError = null;
+            break;
+          } on SerialError catch (e) {
+            lastError = e;
+            await Future<void>.delayed(const Duration(milliseconds: 300));
+          }
+        }
+        if (lastError != null) throw lastError;
+        try {
+          await serial.resetBuffers();
+        } on SerialError {
+          // Best-effort.
+        }
+        _readBuffer.clear();
+        _d('[ESP] USB OTG (S2): port reopened OK');
+        return;
       } else {
         // Classic reset (esptool ClassicReset).
         await setDtr(false);
