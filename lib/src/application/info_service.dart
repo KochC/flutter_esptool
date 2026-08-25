@@ -453,6 +453,17 @@ class InfoService {
           spiMisoDlenOffset: 0x28,
           spiW0Offset: 0x58,
         ),
+      // ESP32-C6 uses the same register layout as S3/C3 but a different SPI
+      // peripheral base (0x60003000 vs 0x60002000).
+      ChipFamily.esp32c6 => const _SpiRegisterMap(
+          base: 0x60003000,
+          spiUsrOffset: 0x18,
+          spiUsr1Offset: 0x1C,
+          spiUsr2Offset: 0x20,
+          spiMosiDlenOffset: 0x24,
+          spiMisoDlenOffset: 0x28,
+          spiW0Offset: 0x58,
+        ),
       ChipFamily.unknown => null,
     };
   }

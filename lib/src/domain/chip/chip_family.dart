@@ -12,6 +12,7 @@ class ChipFamilyResolver {
     0x00000009: ChipFamily.esp32s3,
     0x6921506F: ChipFamily.esp32c3,
     0x001B4F18: ChipFamily.esp32c3,
+    0x2CE0806F: ChipFamily.esp32c6,
   };
 
   /// Resolves a [ChipFamily] from a magic register value.
@@ -26,6 +27,7 @@ class ChipFamilyResolver {
       ChipFamily.esp32s2 => 'ESP32-S2',
       ChipFamily.esp32s3 => 'ESP32-S3',
       ChipFamily.esp32c3 => 'ESP32-C3',
+      ChipFamily.esp32c6 => 'ESP32-C6',
       ChipFamily.unknown => 'Unknown ESP device',
     };
   }

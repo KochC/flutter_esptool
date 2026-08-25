@@ -39,6 +39,12 @@ class ChipDetectionService implements ChipDetectorInterface {
   static const int _esp32s3MacLowRegister = 0x60007044;
   static const int _esp32s3MacHighRegister = 0x60007048;
 
+  // ESP32-C6 reads the factory MAC from its own eFuse block
+  // (MAC_EFUSE_REG = 0x600B0844, high word at +4), distinct from the S3 and
+  // legacy ESP32 register windows.
+  static const int _esp32c6MacLowRegister = 0x600B0844;
+  static const int _esp32c6MacHighRegister = 0x600B0848;
+
   // ESP32-S3 eFuse BLOCK1 registers (verified against esptool.py source).
   // EFUSE_BASE = 0x60007000, BLOCK1 starts at EFUSE_BASE + 0x44 = 0x60007044.
   // word3 = BLOCK1 + 4*3 = 0x60007050
@@ -217,6 +223,10 @@ class ChipDetectionService implements ChipDetectorInterface {
       case ChipFamily.esp32s3:
         lowAddress = _esp32s3MacLowRegister;
         highAddress = _esp32s3MacHighRegister;
+        break;
+      case ChipFamily.esp32c6:
+        lowAddress = _esp32c6MacLowRegister;
+        highAddress = _esp32c6MacHighRegister;
         break;
       default:
         lowAddress = _esp32MacLowRegister;
