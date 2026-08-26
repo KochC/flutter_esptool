@@ -63,6 +63,37 @@ void main() {
       );
     });
 
+    test('parses the ESP32-S2 12-byte payload (no chip_id/api_version)',
+        () async {
+      // The ESP32-S2 returns only the 12-byte common prefix. It must parse
+      // (flags + flash_crypt_cnt + key_purposes) rather than being rejected as
+      // "too short", with chip_id/api_version defaulting to 0.
+      final data = Uint8List(12);
+      final bd = ByteData.sublistView(data);
+      bd.setUint32(0, 0x01, Endian.little); // secure boot flag
+      data[4] = 0x07; // 3 bits → odd → flash encryption active
+      final transport = FakeTransport(securityInfoData: data);
+      final result = await InfoService(transport: transport).getSecurityInfo();
+      expect(result.isSuccess, isTrue);
+      final info = (result as Success<EspSecurityInfo>).value;
+      expect(info.secureBootEnabled, isTrue);
+      expect(info.flashEncryptionEnabled, isTrue);
+      expect(info.chipId, 0);
+      expect(info.apiVersion, 0);
+    });
+
+    test('parses a 16-byte payload (chip_id present, api_version absent)',
+        () async {
+      final data = Uint8List(16);
+      ByteData.sublistView(data).setUint32(12, 0xBEEF, Endian.little);
+      final transport = FakeTransport(securityInfoData: data);
+      final result = await InfoService(transport: transport).getSecurityInfo();
+      expect(result.isSuccess, isTrue);
+      final info = (result as Success<EspSecurityInfo>).value;
+      expect(info.chipId, 0xBEEF);
+      expect(info.apiVersion, 0);
+    });
+
     test('fails when the command reports an error status', () async {
       final transport = FakeTransport(
         onCommand: (c) => failResponse(c.opcode),

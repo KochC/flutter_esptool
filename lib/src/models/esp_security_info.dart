@@ -3,12 +3,16 @@
 
 /// Holds the parsed response from the ESP32 GET_SECURITY_INFO command (opcode 0x14).
 ///
-/// The ROM bootloader returns a 20-byte payload:
-///   [0..3]   flags           (uint32 LE) — reserved / future use
+/// The response length is CHIP-DEPENDENT. Every target returns a 12-byte
+/// common prefix:
+///   [0..3]   flags           (uint32 LE) — bit 0 = Secure Boot active
 ///   [4]      flash_crypt_cnt (uint8)     — odd popcount of bits [2:0] → encryption active
 ///   [5..11]  key_purposes    (7 bytes)   — eFuse key purpose for blocks 1–7
+/// Newer chips (ESP32-S3/C3/C6/…) additionally append:
 ///   [12..15] chip_id         (uint32 LE)
 ///   [16..19] api_version     (uint32 LE) — ROM API version
+/// The ESP32-S2 returns ONLY the 12-byte prefix (no chip_id/api_version), so
+/// those two fields are 0 on the S2.
 ///
 /// Flash encryption is active when the number of set bits in
 /// (flash_crypt_cnt & 0x07) is odd (matches SPI_BOOT_CRYPT_CNT eFuse logic).
