@@ -196,7 +196,14 @@ class MacOSSerialImpl {
           try {
             final bytesRead =
                 _bindings.read(handle, buffer, readLength, nativeTimeoutMs);
-            if (bytesRead < 0) throw _lastError('Error reading on macOS');
+            if (bytesRead < 0) {
+              // EAGAIN/EWOULDBLOCK: FIONREAD reported bytes but they were
+              // consumed before this read (or the buffer briefly emptied).
+              // Not fatal — stop draining and return what we have.
+              final errno = _bindings.getLastErrorCode();
+              if (errno == 35 || errno == 11) break;
+              throw _lastError('Error reading on macOS');
+            }
             if (bytesRead == 0) {
               // Native read timed out with nothing to give — stop draining and
               // return whatever we have collected so far (if any).
@@ -287,6 +294,20 @@ class MacOSSerialImpl {
         );
 
         if (bytesWritten < 0) {
+          // EAGAIN / EWOULDBLOCK (errno 35): the kernel output buffer is
+          // momentarily full on this non-blocking write. That's a transient
+          // "try again" condition, NOT a fatal error — treat it like a 0-byte
+          // write (yield + retry until the deadline) instead of throwing.
+          // Previously this threw "Resource temporarily unavailable" and
+          // aborted long writes (e.g. the ROM FLASH_BEGIN erase on ESP32-S2).
+          final errno = _bindings.getLastErrorCode();
+          if (errno == 35 || errno == 11) {
+            if (DateTime.now().millisecondsSinceEpoch >= deadlineMs) {
+              throw _lastError('Write timeout on macOS');
+            }
+            await Future<void>.delayed(const Duration(milliseconds: 1));
+            continue;
+          }
           throw _lastError('Error writing on macOS');
         }
         totalWritten += bytesWritten;

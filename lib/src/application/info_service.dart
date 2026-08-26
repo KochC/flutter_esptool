@@ -104,12 +104,19 @@ class InfoService {
         );
       }
       final data = response.data;
-      if (data.length < 20) {
+      // Layout is chip-dependent. The COMMON prefix (present on every target,
+      // including the ESP32-S2) is 12 bytes:
+      //   [0..3]  flags (uint32 LE) · [4] flash_crypt_cnt · [5..11] key_purposes
+      // Newer chips (ESP32-S3/C3/C6/…) append chip_id (uint32) + api_version
+      // (uint32) → 20 bytes. The ESP32-S2 returns only the 12-byte prefix, so
+      // requiring ≥20 wrongly rejected it (→ security state "could not be
+      // read"). Require ≥12 and read the extra fields only when present.
+      if (data.length < 12) {
         return Failure<EspSecurityInfo>(
           EspError(
             type: EspErrorType.invalidResponse,
             message: 'GET_SECURITY_INFO response too short: '
-                '${data.length} bytes (expected ≥20)',
+                '${data.length} bytes (expected ≥12)',
           ),
         );
       }
@@ -119,8 +126,8 @@ class InfoService {
           flags: bd.getUint32(0, Endian.little),
           flashCryptCnt: data[4],
           keyPurposes: data.sublist(5, 12).toList(),
-          chipId: bd.getUint32(12, Endian.little),
-          apiVersion: bd.getUint32(16, Endian.little),
+          chipId: data.length >= 16 ? bd.getUint32(12, Endian.little) : 0,
+          apiVersion: data.length >= 20 ? bd.getUint32(16, Endian.little) : 0,
         ),
       );
     } catch (error, stackTrace) {
