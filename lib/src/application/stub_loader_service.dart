@@ -139,9 +139,16 @@ const _memBlockSize = 0x1800; // 6144 bytes
 // ESP32-S3 register addresses (from esptool/targets/esp32s3.py)
 // ---------------------------------------------------------------------------
 // UARTDEV_BUF_NO: ROM .bss variable — indicates which console port is active.
-// Value 4 = USB-JTAG/Serial (our device).
+// Value 3 = USB-JTAG/Serial (matches esptool.py's
+// UARTDEV_BUF_NO_USB_JTAG_SERIAL). Previously wrongly transcribed as 4 here,
+// which meant this port's actual (correct) reading of 3 was misclassified as
+// "not USB-JTAG/Serial" — silently skipping the RTC-WDT/SWD-auto-feed
+// disable this device genuinely needs. Confirmed on real hardware: a full
+// chip erase's flasher-stub upload was intermittently resetting the device
+// back into app firmware mid-upload (the watchdog firing during the ~5 KB
+// stub write), exactly the failure mode this disable step exists to prevent.
 const _uartdevBufNo = 0x3FCEF14C;
-const _uartdevBufNoUsbJtagSerial = 4;
+const _uartdevBufNoUsbJtagSerial = 3;
 
 // RTC WDT registers
 const _rtcCntlBase = 0x60008000;
@@ -523,7 +530,16 @@ class StubLoaderService implements StubLoaderInterface {
           data: payload,
           checksum: EspCommand.calculateChecksum(chunk),
         ),
-        timeout: const Duration(seconds: 5),
+        // 15s (was 5s): the stub is uploaded as ONE ~5.4 KB block (matches
+        // esptool.py's RAM-upload behaviour — blockSize is sized so the
+        // whole segment fits in a single MEM_DATA write). Over a native-USB
+        // CDC connection into the ROM (reached via a software reboot rather
+        // than a real USB-Serial/JTAG bridge or external UART), writing and
+        // acking a block this size was intermittently exceeding 5s even with
+        // the RTC WDT/SWD-auto-feed correctly disabled — a genuine
+        // transport-speed/timing margin issue on this native-USB path, not a
+        // protocol error (MEM_BEGIN/earlier steps all ack near-instantly).
+        timeout: const Duration(seconds: 15),
       );
       if (!dataResp.isSuccess) {
         return Failure<void>(

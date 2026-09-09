@@ -339,7 +339,35 @@ class EspTransport implements EspTransportInterface {
     try {
       _d('[ESP] write ${frame.length} bytes opcode=${command.opcode}: '
           '${frame.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ')}');
-      await serial.write(frame, timeout: effectiveTimeout);
+      // Large frames (the flasher-stub MEM_DATA upload can be ~5.4 KB in ONE
+      // SLIP frame — esptool.py sizes the RAM-upload blockSize so the whole
+      // segment fits in a single MEM_DATA command) are written in smaller
+      // chunks with a brief pause between them, rather than one big
+      // `serial.write()` call. Confirmed on real hardware: over a native-USB
+      // ROM connection reached via a software (non-hardware-reset) reboot,
+      // one large write silently got ZERO response from the device (not a
+      // slow response — no ack at all, even after 15s), while chunking the
+      // identical bytes into ~standard USB full-speed bulk packet size
+      // pieces let the device's RX path keep up and ack normally. This
+      // matches a small-device-side-buffer/overflow explanation better than
+      // a timing one. Small frames (the overwhelming majority of commands)
+      // are unaffected — sent in one write exactly as before.
+      const chunkThreshold = 256;
+      const chunkSize = 64;
+      if (frame.length <= chunkThreshold) {
+        await serial.write(frame, timeout: effectiveTimeout);
+      } else {
+        for (var offset = 0; offset < frame.length; offset += chunkSize) {
+          final end = (offset + chunkSize).clamp(0, frame.length);
+          final chunk = offset == 0 && end == frame.length
+              ? frame
+              : Uint8List.sublistView(frame, offset, end);
+          await serial.write(chunk, timeout: effectiveTimeout);
+          if (end < frame.length) {
+            await Future<void>.delayed(const Duration(milliseconds: 2));
+          }
+        }
+      }
       _d('[ESP] write done');
       // Do NOT call serial.flush() here — on macOS it calls tcdrain() which
       // blocks the isolate until all bytes have been transmitted at the hardware
