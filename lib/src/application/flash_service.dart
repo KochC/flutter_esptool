@@ -51,7 +51,6 @@ class FlashService implements FlashServiceInterface {
   /// after any reset/reconnect that puts the chip back in a fresh ROM state.
   void resetSpiAttachState() => _spiAttached = false;
 
-
   /// The flash block size used for chunked writes.
   final int blockSize;
 
@@ -854,22 +853,43 @@ class FlashService implements FlashServiceInterface {
         );
       }
 
-      // FLASH_BEGIN with num_blocks=0 and erase_size = full region.
-      // The ROM erases synchronously before returning the ACK, so the
-      // timeout must cover the full erase duration (~25 s/MB for ROM).
+      // NOTE: this used to send a bare FLASH_BEGIN with num_blocks=0 (erase
+      // the whole region, then FLASH_END immediately, no data blocks) on the
+      // theory that the ROM pre-erases `erase_size` synchronously before
+      // ACKing FLASH_BEGIN. Confirmed on real ESP32-S2 hardware that this
+      // does NOT hold: the FLASH_BEGIN -> ACK -> FLASH_END -> ACK round trip
+      // for a 4 MB region completed in under 50ms total (a real physical
+      // erase takes seconds, not milliseconds) and a subsequent
+      // re-provision of the device showed the flash was NOT actually
+      // wiped -- the ROM appears to erase lazily as FLASH_DATA blocks
+      // arrive, not eagerly for the whole declared erase_size when zero
+      // blocks are sent.
+      //
+      // Fixed by actually writing real FLASH_DATA blocks (all 0xFF -- NOR
+      // flash's erased state) across the whole region instead of relying
+      // on a bare FLASH_BEGIN/FLASH_END pair. This is the exact same
+      // begin/data/end sequence proven to work for real firmware writes
+      // elsewhere in this library, so it can't hit the same "erase never
+      // actually happens" failure mode -- writing real data with a real
+      // block count leaves the ROM no room to skip the erase.
+      final numBlocks = (eraseSize + blockSize - 1) ~/ blockSize;
       final eraseSeconds =
           (25 * (eraseSize / (1024 * 1024))).ceil().clamp(10, 600);
       // ignore: avoid_print
       print(
-          '[FlashService] eraseRegionRom: offset=0x${offset.toRadixString(16)}'
-          ' eraseSize=0x${eraseSize.toRadixString(16)} timeout=${eraseSeconds}s');
+        '[FlashService] eraseRegionRom: offset=0x${offset.toRadixString(16)}'
+        ' eraseSize=0x${eraseSize.toRadixString(16)} blocks=$numBlocks'
+        ' blockSize=0x${blockSize.toRadixString(16)} timeout=${eraseSeconds}s'
+        ' (writing real 0xFF-filled blocks, not a bare FLASH_BEGIN erase)',
+      );
+
       final beginResponse = await _transport.sendCommand(
         EspCommand(
           opcode: EspCommandOpcode.flashBegin,
           checksum: 0,
           data: _buildFlashBeginPayload(
             totalBytes: eraseSize,
-            blockCount: 0,
+            blockCount: numBlocks,
             offset: offset,
           ),
         ),
@@ -883,6 +903,33 @@ class FlashService implements FlashServiceInterface {
           ),
         );
       }
+
+      final blankBlock = Uint8List(blockSize)..fillRange(0, blockSize, 0xFF);
+      for (var i = 0; i < numBlocks; i++) {
+        final response = await _transport.sendCommand(
+          EspCommand(
+            opcode: EspCommandOpcode.flashData,
+            data: _buildFlashDataPayload(payload: blankBlock, sequence: i),
+            checksum: EspCommand.calculateChecksum(blankBlock),
+          ),
+        );
+        if (!response.isSuccess) {
+          return Failure<void>(
+            EspError(
+              type: EspErrorType.flashEraseFailed,
+              message: 'Device rejected erase data block $i of $numBlocks '
+                  '(offset 0x${(offset + i * blockSize).toRadixString(16)})',
+            ),
+          );
+        }
+        // Yield so the event loop / UI can process between round-trips —
+        // same reason _writeFlashAttempt does this for real writes.
+        await Future<void>.delayed(Duration.zero);
+      }
+
+      // Give the device a moment to settle after the last data block —
+      // same as the real write path.
+      await Future<void>.delayed(const Duration(milliseconds: 200));
 
       // FLASH_END with reboot=1 (stay in download mode) so we can continue.
       final endResponse = await _transport.sendCommand(
