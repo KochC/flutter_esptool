@@ -19,13 +19,16 @@ abstract interface class FlashServiceInterface {
 
   /// Erases a flash region using the ROM bootloader FLASH_BEGIN erase path.
   ///
-  /// Sends FLASH_BEGIN with [eraseSize] bytes to erase starting at [offset]
-  /// and zero data blocks, then immediately sends FLASH_END.  This is the
-  /// only erase mechanism supported by the ESP32-S3 ROM (opcode 0xD0 and
-  /// 0xD1 are stub-only).  [eraseSize] must be a multiple of 4096.
+  /// Sends FLASH_BEGIN for [eraseSize] bytes at [offset] and writes 0xFF
+  /// blocks over the whole region (the ROM has no erase opcode; 0xD0/0xD1
+  /// are stub-only). Sends no FLASH_END — the next FLASH_BEGIN on the same
+  /// connection finalises it. [eraseSize] must be a multiple of 4096.
+  /// [onProgress] receives the completed fraction (0.0–1.0) after each
+  /// block; a full ROM erase takes minutes.
   Future<Result<void>> eraseRegionRom({
     required int offset,
     required int eraseSize,
+    void Function(double fraction)? onProgress,
   });
 
   /// Computes the device MD5 for the flash range.

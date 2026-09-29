@@ -108,6 +108,18 @@ void main() {
       expect(t.count(EspCommandOpcode.flashEnd), 0);
     });
 
+    test('reports progress once per erase block, ending at 1.0', () async {
+      final t = _RecordingTransport();
+      final flash = FlashService(transport: t, blockSize: 0x400);
+      final seen = <double>[];
+      await flash.eraseRegionRom(
+        offset: 0,
+        eraseSize: 0x1000,
+        onProgress: seen.add,
+      );
+      expect(seen, [0.25, 0.5, 0.75, 1.0]);
+    });
+
     test('a second erase on the same connection does not re-attach', () async {
       final t = _RecordingTransport();
       final flash = FlashService(transport: t, blockSize: 0x400);

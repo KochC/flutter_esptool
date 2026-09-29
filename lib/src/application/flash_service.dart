@@ -829,6 +829,7 @@ class FlashService implements FlashServiceInterface {
   Future<Result<void>> eraseRegionRom({
     required int offset,
     required int eraseSize,
+    void Function(double fraction)? onProgress,
   }) async {
     try {
       if (eraseSize <= 0 || eraseSize % 4096 != 0) {
@@ -928,6 +929,7 @@ class FlashService implements FlashServiceInterface {
             ),
           );
         }
+        onProgress?.call((i + 1) / numBlocks);
         // Yield so the event loop / UI can process between round-trips —
         // same reason _writeFlashAttempt does this for real writes.
         await Future<void>.delayed(Duration.zero);
