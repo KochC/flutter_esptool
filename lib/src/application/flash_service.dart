@@ -840,17 +840,23 @@ class FlashService implements FlashServiceInterface {
         );
       }
 
-      // SPI_ATTACH is required before any flash command.
-      final attachResponse = await _transport.sendCommand(
-        EspCommand(opcode: EspCommandOpcode.spiAttach, data: Uint8List(8)),
-      );
-      if (!attachResponse.isSuccess) {
-        return const Failure<void>(
-          EspError(
-            type: EspErrorType.flashEraseFailed,
-            message: 'SPI attach failed before erase',
-          ),
+      // SPI_ATTACH is required before any flash command — but only ONCE per
+      // connection (see [_spiAttached]): the writes that usually follow this
+      // erase on the same connection must not attach again, or the ESP32-S2
+      // ROM stops responding after the erase's FLASH_END(1).
+      if (!_spiAttached) {
+        final attachResponse = await _transport.sendCommand(
+          EspCommand(opcode: EspCommandOpcode.spiAttach, data: Uint8List(8)),
         );
+        if (!attachResponse.isSuccess) {
+          return const Failure<void>(
+            EspError(
+              type: EspErrorType.flashEraseFailed,
+              message: 'SPI attach failed before erase',
+            ),
+          );
+        }
+        _spiAttached = true;
       }
 
       // NOTE: this used to send a bare FLASH_BEGIN with num_blocks=0 (erase
