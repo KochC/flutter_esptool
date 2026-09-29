@@ -937,23 +937,12 @@ class FlashService implements FlashServiceInterface {
       // same as the real write path.
       await Future<void>.delayed(const Duration(milliseconds: 200));
 
-      // FLASH_END with reboot=1 (stay in download mode) so we can continue.
-      final endResponse = await _transport.sendCommand(
-        EspCommand(
-          opcode: EspCommandOpcode.flashEnd,
-          checksum: 0,
-          data: _u32(1), // 1 = stay in download mode
-        ),
-      );
-      if (!endResponse.isSuccess) {
-        return const Failure<void>(
-          EspError(
-            type: EspErrorType.flashEraseFailed,
-            message: 'FLASH_END after erase rejected by device',
-          ),
-        );
-      }
-
+      // No FLASH_END: the erase is always followed by writes on the same
+      // connection, and the next FLASH_BEGIN implicitly finalises it (as
+      // between the regions of a multi-region ROM write, see
+      // [writeFlash]). A FLASH_END(1) here made the ESP32-S2 ROM ignore the
+      // next FLASH_BEGIN (observed: PSU-2.3, bootloader write after the 4 MB
+      // ROM erase timed out twice).
       return const Success<void>(null);
     } catch (error, stackTrace) {
       final espError = error is EspError

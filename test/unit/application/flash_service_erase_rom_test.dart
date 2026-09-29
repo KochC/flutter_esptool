@@ -84,6 +84,30 @@ void main() {
       expect(t.opcodes.first, EspCommandOpcode.spiAttach);
     });
 
+    test(
+        'the erase sends no FLASH_END: the next FLASH_BEGIN follows the last '
+        'erase block directly (FLASH_END(1) then FLASH_BEGIN stalls the '
+        'ESP32-S2 ROM)', () async {
+      final t = _RecordingTransport();
+      final flash = FlashService(transport: t, blockSize: 0x400);
+      await flash.eraseRegionRom(offset: 0, eraseSize: 0x1000);
+      expect(t.count(EspCommandOpcode.flashEnd), 0);
+      await flash.writeFlash(
+        FlashParameters(
+          offset: 0,
+          data: Uint8List(0x400),
+          leaveInDownloadMode: true,
+        ),
+      );
+      final begins = [
+        for (var i = 0; i < t.opcodes.length; i++)
+          if (t.opcodes[i] == EspCommandOpcode.flashBegin) i,
+      ];
+      expect(begins, hasLength(2));
+      expect(t.opcodes[begins[1] - 1], EspCommandOpcode.flashData);
+      expect(t.count(EspCommandOpcode.flashEnd), 0);
+    });
+
     test('a second erase on the same connection does not re-attach', () async {
       final t = _RecordingTransport();
       final flash = FlashService(transport: t, blockSize: 0x400);
