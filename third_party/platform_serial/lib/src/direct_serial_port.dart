@@ -28,6 +28,17 @@ class DirectSerialPort implements SerialPortInterface {
   SerialConfig? _config;
   bool _isOpen = false;
 
+  /// A platform read that outlived its caller's [read] timeout.
+  ///
+  /// [Future.timeout] only stops *waiting*: the platform read keeps polling
+  /// (on macOS until the port's own read deadline) and consumes whatever
+  /// arrives next. Starting a second platform read beside it would race it —
+  /// the orphan wins and its bytes are dropped (observed: the ESP stub's
+  /// ERASE_FLASH reply lost after a 0.5 s OHAI poll timed out, then a
+  /// 300 s "Timed out waiting for an ESP response"). The next [read] awaits
+  /// this read instead, so its bytes reach the caller.
+  Future<Uint8List>? _pendingRead;
+
   // Unused stream stubs required by the interface.
   final _dataStream = StreamController<Uint8List>.broadcast();
   final _textStream = StreamController<String>.broadcast();
@@ -78,6 +89,7 @@ class DirectSerialPort implements SerialPortInterface {
     final portName = _config!.portName;
     _isOpen = false;
     _config = null;
+    _pendingRead = null; // belongs to this session; never hand it to the next
     await (_platform as dynamic).closePort(portName) as dynamic;
   }
 
@@ -93,14 +105,21 @@ class DirectSerialPort implements SerialPortInterface {
     // ignore: avoid_print
     print(
         '${DateTime.now().toIso8601String()} [DSP] read(length=$length timeout=${t.inMilliseconds}ms)');
+    // Resume a read that timed out earlier rather than racing it (see
+    // [_pendingRead]); only start a new platform read when none is running.
+    final resumed = _pendingRead != null;
+    final pending =
+        _pendingRead ?? _platform.readData(_config!.portName, length);
+    _pendingRead = pending;
     try {
-      final result =
-          await _platform.readData(_config!.portName, length).timeout(t);
+      final result = await pending.timeout(t);
+      if (identical(_pendingRead, pending)) _pendingRead = null;
       // ignore: avoid_print
       print(
-          '${DateTime.now().toIso8601String()} [DSP] read returned ${result.length} bytes');
+          '${DateTime.now().toIso8601String()} [DSP] read returned ${result.length} bytes${resumed ? ' (resumed)' : ''}');
       return result;
     } on TimeoutException {
+      // Keep [_pendingRead]: its bytes belong to the next read.
       // ignore: avoid_print
       print(
           '${DateTime.now().toIso8601String()} [DSP] read TimeoutException after ${t.inMilliseconds}ms');
@@ -109,6 +128,7 @@ class DirectSerialPort implements SerialPortInterface {
         message: 'Read timeout',
       );
     } catch (e) {
+      if (identical(_pendingRead, pending)) _pendingRead = null;
       // ignore: avoid_print
       print('${DateTime.now().toIso8601String()} [DSP] read threw: $e');
       rethrow;

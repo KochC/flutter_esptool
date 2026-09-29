@@ -51,7 +51,6 @@ class FlashService implements FlashServiceInterface {
   /// after any reset/reconnect that puts the chip back in a fresh ROM state.
   void resetSpiAttachState() => _spiAttached = false;
 
-
   /// The flash block size used for chunked writes.
   final int blockSize;
 
@@ -830,6 +829,7 @@ class FlashService implements FlashServiceInterface {
   Future<Result<void>> eraseRegionRom({
     required int offset,
     required int eraseSize,
+    void Function(double fraction)? onProgress,
   }) async {
     try {
       if (eraseSize <= 0 || eraseSize % 4096 != 0) {
@@ -841,35 +841,62 @@ class FlashService implements FlashServiceInterface {
         );
       }
 
-      // SPI_ATTACH is required before any flash command.
-      final attachResponse = await _transport.sendCommand(
-        EspCommand(opcode: EspCommandOpcode.spiAttach, data: Uint8List(8)),
-      );
-      if (!attachResponse.isSuccess) {
-        return const Failure<void>(
-          EspError(
-            type: EspErrorType.flashEraseFailed,
-            message: 'SPI attach failed before erase',
-          ),
+      // SPI_ATTACH is required before any flash command — but only ONCE per
+      // connection (see [_spiAttached]): the writes that usually follow this
+      // erase on the same connection must not attach again, or the ESP32-S2
+      // ROM stops responding after the erase's FLASH_END(1).
+      if (!_spiAttached) {
+        final attachResponse = await _transport.sendCommand(
+          EspCommand(opcode: EspCommandOpcode.spiAttach, data: Uint8List(8)),
         );
+        if (!attachResponse.isSuccess) {
+          return const Failure<void>(
+            EspError(
+              type: EspErrorType.flashEraseFailed,
+              message: 'SPI attach failed before erase',
+            ),
+          );
+        }
+        _spiAttached = true;
       }
 
-      // FLASH_BEGIN with num_blocks=0 and erase_size = full region.
-      // The ROM erases synchronously before returning the ACK, so the
-      // timeout must cover the full erase duration (~25 s/MB for ROM).
+      // NOTE: this used to send a bare FLASH_BEGIN with num_blocks=0 (erase
+      // the whole region, then FLASH_END immediately, no data blocks) on the
+      // theory that the ROM pre-erases `erase_size` synchronously before
+      // ACKing FLASH_BEGIN. Confirmed on real ESP32-S2 hardware that this
+      // does NOT hold: the FLASH_BEGIN -> ACK -> FLASH_END -> ACK round trip
+      // for a 4 MB region completed in under 50ms total (a real physical
+      // erase takes seconds, not milliseconds) and a subsequent
+      // re-provision of the device showed the flash was NOT actually
+      // wiped -- the ROM appears to erase lazily as FLASH_DATA blocks
+      // arrive, not eagerly for the whole declared erase_size when zero
+      // blocks are sent.
+      //
+      // Fixed by actually writing real FLASH_DATA blocks (all 0xFF -- NOR
+      // flash's erased state) across the whole region instead of relying
+      // on a bare FLASH_BEGIN/FLASH_END pair. This is the exact same
+      // begin/data/end sequence proven to work for real firmware writes
+      // elsewhere in this library, so it can't hit the same "erase never
+      // actually happens" failure mode -- writing real data with a real
+      // block count leaves the ROM no room to skip the erase.
+      final numBlocks = (eraseSize + blockSize - 1) ~/ blockSize;
       final eraseSeconds =
           (25 * (eraseSize / (1024 * 1024))).ceil().clamp(10, 600);
       // ignore: avoid_print
       print(
-          '[FlashService] eraseRegionRom: offset=0x${offset.toRadixString(16)}'
-          ' eraseSize=0x${eraseSize.toRadixString(16)} timeout=${eraseSeconds}s');
+        '[FlashService] eraseRegionRom: offset=0x${offset.toRadixString(16)}'
+        ' eraseSize=0x${eraseSize.toRadixString(16)} blocks=$numBlocks'
+        ' blockSize=0x${blockSize.toRadixString(16)} timeout=${eraseSeconds}s'
+        ' (writing real 0xFF-filled blocks, not a bare FLASH_BEGIN erase)',
+      );
+
       final beginResponse = await _transport.sendCommand(
         EspCommand(
           opcode: EspCommandOpcode.flashBegin,
           checksum: 0,
           data: _buildFlashBeginPayload(
             totalBytes: eraseSize,
-            blockCount: 0,
+            blockCount: numBlocks,
             offset: offset,
           ),
         ),
@@ -884,23 +911,40 @@ class FlashService implements FlashServiceInterface {
         );
       }
 
-      // FLASH_END with reboot=1 (stay in download mode) so we can continue.
-      final endResponse = await _transport.sendCommand(
-        EspCommand(
-          opcode: EspCommandOpcode.flashEnd,
-          checksum: 0,
-          data: _u32(1), // 1 = stay in download mode
-        ),
-      );
-      if (!endResponse.isSuccess) {
-        return const Failure<void>(
-          EspError(
-            type: EspErrorType.flashEraseFailed,
-            message: 'FLASH_END after erase rejected by device',
+      final blankBlock = Uint8List(blockSize)..fillRange(0, blockSize, 0xFF);
+      for (var i = 0; i < numBlocks; i++) {
+        final response = await _transport.sendCommand(
+          EspCommand(
+            opcode: EspCommandOpcode.flashData,
+            data: _buildFlashDataPayload(payload: blankBlock, sequence: i),
+            checksum: EspCommand.calculateChecksum(blankBlock),
           ),
         );
+        if (!response.isSuccess) {
+          return Failure<void>(
+            EspError(
+              type: EspErrorType.flashEraseFailed,
+              message: 'Device rejected erase data block $i of $numBlocks '
+                  '(offset 0x${(offset + i * blockSize).toRadixString(16)})',
+            ),
+          );
+        }
+        onProgress?.call((i + 1) / numBlocks);
+        // Yield so the event loop / UI can process between round-trips —
+        // same reason _writeFlashAttempt does this for real writes.
+        await Future<void>.delayed(Duration.zero);
       }
 
+      // Give the device a moment to settle after the last data block —
+      // same as the real write path.
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+
+      // No FLASH_END: the erase is always followed by writes on the same
+      // connection, and the next FLASH_BEGIN implicitly finalises it (as
+      // between the regions of a multi-region ROM write, see
+      // [writeFlash]). A FLASH_END(1) here made the ESP32-S2 ROM ignore the
+      // next FLASH_BEGIN (observed: PSU-2.3, bootloader write after the 4 MB
+      // ROM erase timed out twice).
       return const Success<void>(null);
     } catch (error, stackTrace) {
       final espError = error is EspError
