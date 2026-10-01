@@ -1,3 +1,15 @@
+## Unreleased
+
+- **Licensing fix:** the embedded ESP32-S3 flasher stub was esptool's legacy
+  stub (GPL-2.0-or-later, from esptool 4.8.1 `stub_flasher/1/`) but was
+  labelled MIT. It is replaced by Espressif's esp-flasher-stub v0.7.0
+  (MIT OR Apache-2.0), the same project as the new ESP32-S2 stub. License
+  texts and binary hashes: `third_party/esp-flasher-stub/`; the MIT notice
+  is appended to `LICENSE` so it reaches apps' `NOTICES`.
+- ESP32-S2 flasher stub; `eraseRegionRom` attaches SPI once, sends no
+  FLASH_END and reports progress; `DirectSerialPort` resumes a timed-out
+  read instead of racing it.
+
 ## 0.1.5
 
 - Fixed blocking FFI serial reads: moved CPU-bound serial I/O off the UI
