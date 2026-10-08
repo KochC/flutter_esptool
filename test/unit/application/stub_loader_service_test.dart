@@ -3,10 +3,28 @@
 
 import 'dart:typed_data';
 
+import 'package:crypto/crypto.dart';
 import 'package:flutter_esptool/flutter_esptool.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import '../support/fake_transport.dart';
+
+/// The bytes uploaded per MEM_BEGIN segment, reassembled from MEM_DATA.
+List<Uint8List> _uploadedSegments(FakeTransport t) {
+  final segments = <BytesBuilder>[];
+  for (final c in t.sentCommands) {
+    if (c.opcode == EspCommandOpcode.memBegin) {
+      segments.add(BytesBuilder());
+    } else if (c.opcode == EspCommandOpcode.memData) {
+      segments.last.add(c.data.sublist(16));
+    }
+  }
+  return [for (final b in segments) b.toBytes()];
+}
+
+int _entry(FakeTransport t) => ByteData.sublistView(
+      t.sentCommands.lastWhere((c) => c.opcode == EspCommandOpcode.memEnd).data,
+    ).getUint32(4, Endian.little);
 
 void main() {
   group('StubLoaderService.loadStub', () {
@@ -129,5 +147,37 @@ void main() {
       expect(
           ByteData.sublistView(begin.data).getUint32(8, Endian.little), 0x1800);
     });
+
+    // Provenance pins (third_party/esp-flasher-stub/README.md): the embedded
+    // stubs must stay esp-flasher-stub v0.7.0 (MIT OR Apache-2.0) — never
+    // the GPL legacy stub from esptool's stub_flasher/1/.
+    for (final (chip, text, data, entry) in [
+      (
+        ChipFamily.esp32s3,
+        '911d584127cbbecef6661d60aa0ff97357add29153fff10d98e700fb76f05b71',
+        'd02b76d857480cec0f861ef353009551feb7574deffca599cc1ea9d0758103f0',
+        0x4037800C,
+      ),
+      (
+        ChipFamily.esp32s2,
+        'f038186b9984b8767654ef1bd8da8d1b9db939762f2cb07a5854dcf0c1f8909f',
+        'a8897efc120fd1c7e74f439c3b8aea3488c84995c0ca2c514c2a5c25c78b6c9d',
+        0x4002800C,
+      ),
+    ]) {
+      test('$chip uploads the pinned esp-flasher-stub v0.7.0 binary', () async {
+        final transport = FakeTransport(
+          readRawBytes: <int>[0xC0, 0x4F, 0x48, 0x41, 0x49, 0xC0],
+        );
+        final result =
+            await StubLoaderService(transport: transport).loadStub(chip);
+        expect(result.isSuccess, isTrue);
+        final segments = _uploadedSegments(transport);
+        expect(segments, hasLength(2));
+        expect(sha256.convert(segments[0]).toString(), text);
+        expect(sha256.convert(segments[1]).toString(), data);
+        expect(_entry(transport), entry);
+      });
+    }
   });
 }
