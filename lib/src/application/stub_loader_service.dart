@@ -19,8 +19,9 @@ void _d(String msg) {
 // ---------------------------------------------------------------------------
 // Flasher stub binaries (embedded as base64).
 //
-// Both stubs are Espressif's esp-flasher-stub v0.7.0, as shipped in
-// esptool 4.12.0 under targets/stub_flasher/2/ (esp32s3.json, esp32s2.json),
+// All stubs are Espressif's esp-flasher-stub v0.7.0, as shipped in
+// esptool 4.12.0 under targets/stub_flasher/2/ (esp32s3.json, esp32s2.json,
+// esp32c6.json),
 // uploaded the way esptool does (MEM_BEGIN/MEM_DATA, MEM_END -> OHAI):
 //   https://github.com/espressif/esp-flasher-stub/releases/tag/v0.7.0
 // Copyright (c) 2025 Espressif Systems (Shanghai) CO LTD, dual-licensed
@@ -347,6 +348,199 @@ const _esp32s2TextStart = 0x40028000;
 const _esp32s2DataStart = 0x3FFE2DB4;
 const _esp32s2Entry = 0x4002800C;
 
+// ESP32-C6 (same esp-flasher-stub v0.7.0 release, see above).
+const _esp32c6TextB64 =
+    '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'
+    'x8EUQzcGBADRjhTDI6AHAIKAAAA=';
+
+const _esp32c6DataB64 =
+    '/BGAQEyChECOA4BAjgOAQI4DgECOA4BAjgOAQI4DgECOA4BAjgOAQI4DgECOA4BAjgOAQI4DgECO'
+    'A4BAjgOAQI4DgECOA4BAjgOAQI4DgECOA4BAjgOAQI4DgECOA4BAjgOAQI4DgECOA4BAjgOAQI4D'
+    'gECqCoBAtgqAQAILgEAuC4BAuAuAQGILgECMCoBA+guAQHYMgECcDIBAQgqAQIoMgEBCCoBAAg2A'
+    'QBINgEAWDYBAAguAQG4NgECCDYBA';
+
+const _esp32c6TextStart = 0x40800000;
+const _esp32c6DataStart = 0x40852D64;
+const _esp32c6Entry = 0x40800000;
+
+/// The registers that keep a chip's RTC watchdog (RWDT) and super watchdog
+/// (SWD) from resetting it while it talks to the host over USB-Serial/JTAG.
+///
+/// On that port the ROM leaves both watchdogs running, so a long operation
+/// (stub upload, chip erase, large write) gets the chip reset partway
+/// through. esptool's `disable_watchdogs()` (esptool/targets/esp32c3.py,
+/// inherited by the ESP32-S3 and ESP32-C6 targets) disables the RWDT and
+/// sets the SWD to auto-feed; [StubLoaderService] does the same before the
+/// stub upload. Values are from each chip's esptool target file.
+class _UsbJtagWatchdogs {
+  const _UsbJtagWatchdogs({
+    required this.uartdevBufNo,
+    required this.wdtConfig0Reg,
+    required this.wdtWprotectReg,
+    required this.swdConfReg,
+    required this.swdAutoFeedEn,
+    required this.swdWprotectReg,
+    required this.swdWkey,
+  });
+
+  /// ROM .bss variable `UartDev.buff_uart_no`: the console port in use.
+  final int uartdevBufNo;
+  final int wdtConfig0Reg;
+  final int wdtWprotectReg;
+  final int swdConfReg;
+  final int swdAutoFeedEn;
+  final int swdWprotectReg;
+  final int swdWkey;
+}
+
+/// `UARTDEV_BUF_NO` value when the console is USB-Serial/JTAG (esptool
+/// `UARTDEV_BUF_NO_USB_JTAG_SERIAL`, the same on every chip that has one).
+///
+/// Previously wrongly transcribed as 4 here, which meant the actual (correct)
+/// reading of 3 was misclassified as "not USB-JTAG/Serial" — silently skipping
+/// the watchdog disable. Confirmed on real ESP32-S3 hardware: a full chip
+/// erase's flasher-stub upload was intermittently resetting the device back
+/// into app firmware mid-upload (the watchdog firing during the stub write).
+const _uartdevBufNoUsbJtagSerial = 3;
+
+/// RWDT write-protect key (`RTC_CNTL_WDT_WKEY`, the same on S3 and C6).
+const _rtcWdtWkey = 0x50D83AA1;
+
+/// ESP32-S3 (esptool/targets/esp32s3.py): RTC_CNTL block at 0x60008000.
+const _esp32s3Watchdogs = _UsbJtagWatchdogs(
+  uartdevBufNo: 0x3FCEF14C,
+  wdtConfig0Reg: 0x60008000 + 0x0098,
+  wdtWprotectReg: 0x60008000 + 0x00B0,
+  swdConfReg: 0x60008000 + 0x00B4,
+  swdAutoFeedEn: 1 << 31,
+  swdWprotectReg: 0x60008000 + 0x00B8,
+  swdWkey: 0x8F1D312A,
+);
+
+/// ESP32-C6 (esptool/targets/esp32c6.py): the watchdogs live in the LP_WDT
+/// block at 0x600B1C00, the SWD auto-feed bit is bit 18 (not 31) and its key
+/// equals the RWDT key.
+const _esp32c6Watchdogs = _UsbJtagWatchdogs(
+  uartdevBufNo: 0x4087F580,
+  wdtConfig0Reg: 0x600B1C00,
+  wdtWprotectReg: 0x600B1C00 + 0x0018,
+  swdConfReg: 0x600B1C00 + 0x001C,
+  swdAutoFeedEn: 1 << 18,
+  swdWprotectReg: 0x600B1C00 + 0x0020,
+  swdWkey: 0x50D83AA1,
+);
+
 /// One chip's flasher stub and how to upload it.
 class _StubImage {
   const _StubImage({
@@ -356,7 +550,7 @@ class _StubImage {
     required this.dataStart,
     required this.entry,
     required this.memBlockSize,
-    this.disableUsbJtagWatchdogs = false,
+    this.usbJtagWatchdogs,
   });
 
   final String textB64;
@@ -367,11 +561,12 @@ class _StubImage {
 
   /// MEM_DATA block size. esptool uses 0x800 (USB_RAM_BLOCK) for an ESP32-S2
   /// on its USB-OTG ROM port; smaller blocks are always accepted, so the S2
-  /// uses it on every port.
+  /// uses it on every port. Everything else uses ESP_RAM_BLOCK (0x1800).
   final int memBlockSize;
 
-  /// ESP32-S3 on USB-Serial/JTAG: disable the RTC WDT and feed the SWD first.
-  final bool disableUsbJtagWatchdogs;
+  /// Watchdogs to disable first when the chip is on USB-Serial/JTAG; null
+  /// for a chip without that peripheral (ESP32-S2).
+  final _UsbJtagWatchdogs? usbJtagWatchdogs;
 }
 
 const _stubs = <ChipFamily, _StubImage>{
@@ -382,7 +577,7 @@ const _stubs = <ChipFamily, _StubImage>{
     dataStart: _esp32s3DataStart,
     entry: _esp32s3Entry,
     memBlockSize: 0x1800,
-    disableUsbJtagWatchdogs: true,
+    usbJtagWatchdogs: _esp32s3Watchdogs,
   ),
   ChipFamily.esp32s2: _StubImage(
     textB64: _esp32s2TextB64,
@@ -392,36 +587,18 @@ const _stubs = <ChipFamily, _StubImage>{
     entry: _esp32s2Entry,
     memBlockSize: 0x800,
   ),
+  ChipFamily.esp32c6: _StubImage(
+    textB64: _esp32c6TextB64,
+    dataB64: _esp32c6DataB64,
+    textStart: _esp32c6TextStart,
+    dataStart: _esp32c6DataStart,
+    entry: _esp32c6Entry,
+    memBlockSize: 0x1800,
+    usbJtagWatchdogs: _esp32c6Watchdogs,
+  ),
 };
 
-// ---------------------------------------------------------------------------
-// ESP32-S3 register addresses (from esptool/targets/esp32s3.py)
-// ---------------------------------------------------------------------------
-// UARTDEV_BUF_NO: ROM .bss variable — indicates which console port is active.
-// Value 3 = USB-JTAG/Serial (matches esptool.py's
-// UARTDEV_BUF_NO_USB_JTAG_SERIAL). Previously wrongly transcribed as 4 here,
-// which meant this port's actual (correct) reading of 3 was misclassified as
-// "not USB-JTAG/Serial" — silently skipping the RTC-WDT/SWD-auto-feed
-// disable this device genuinely needs. Confirmed on real hardware: a full
-// chip erase's flasher-stub upload was intermittently resetting the device
-// back into app firmware mid-upload (the watchdog firing during the ~5 KB
-// stub write), exactly the failure mode this disable step exists to prevent.
-const _uartdevBufNo = 0x3FCEF14C;
-const _uartdevBufNoUsbJtagSerial = 3;
-
-// RTC WDT registers
-const _rtcCntlBase = 0x60008000;
-const _rtcCntlWdtConfig0Reg = _rtcCntlBase + 0x0098;
-const _rtcCntlWdtWprotectReg = _rtcCntlBase + 0x00B0;
-const _rtcCntlWdtWkey = 0x50D83AA1;
-
-// Super WDT (SWD) registers
-const _rtcCntlSwdConfReg = _rtcCntlBase + 0x00B4;
-const _rtcCntlSwdAutoFeedEn = 1 << 31;
-const _rtcCntlSwdWprotectReg = _rtcCntlBase + 0x00B8;
-const _rtcCntlSwdWkey = 0x8F1D312A;
-
-/// Loads the ESP32-S3 or ESP32-S2 flasher stub into device RAM via
+/// Loads the ESP32-S3, ESP32-S2 or ESP32-C6 flasher stub into device RAM via
 /// MEM_BEGIN/MEM_DATA/MEM_END.
 ///
 /// Once loaded, the stub takes over from the ROM bootloader and enables
@@ -445,8 +622,8 @@ class StubLoaderService implements StubLoaderInterface {
       return Failure<void>(
         EspError(
           type: EspErrorType.stubNotAvailable,
-          message: 'Stub is only available for ESP32-S3 and ESP32-S2 '
-              '(got $family)',
+          message: 'Stub is only available for ESP32-S3, ESP32-S2 and '
+              'ESP32-C6 (got $family)',
         ),
       );
     }
@@ -464,7 +641,8 @@ class StubLoaderService implements StubLoaderInterface {
       // esptool does this in _post_connect() → disable_watchdogs() before any
       // stub upload attempt.
       // -----------------------------------------------------------------------
-      if (stub.disableUsbJtagWatchdogs) await _disableWatchdogsIfUsbJtag();
+      final watchdogs = stub.usbJtagWatchdogs;
+      if (watchdogs != null) await _disableWatchdogsIfUsbJtag(watchdogs);
 
       final text = base64.decode(stub.textB64);
       final data = base64.decode(stub.dataB64);
@@ -578,10 +756,10 @@ class StubLoaderService implements StubLoaderInterface {
 
   /// Reads UARTDEV_BUF_NO to check if connected via USB-JTAG/Serial.
   /// If so, disables the RTC WDT and puts the SWD into auto-feed mode.
-  Future<void> _disableWatchdogsIfUsbJtag() async {
+  Future<void> _disableWatchdogsIfUsbJtag(_UsbJtagWatchdogs regs) async {
     _d('Checking UARTDEV_BUF_NO for USB-JTAG/Serial detection...');
     try {
-      final uartNo = await _readReg(_uartdevBufNo);
+      final uartNo = await _readReg(regs.uartdevBufNo);
       _d('UARTDEV_BUF_NO = $uartNo');
       if (uartNo != _uartdevBufNoUsbJtagSerial) {
         _d('Not USB-JTAG/Serial — watchdog disable skipped');
@@ -593,19 +771,19 @@ class StubLoaderService implements StubLoaderInterface {
       //   1. Unlock write-protect register with the WDT key.
       //   2. Write 0 to WDTCONFIG0 (disables the WDT).
       //   3. Re-lock the write-protect register.
-      await _writeReg(_rtcCntlWdtWprotectReg, _rtcCntlWdtWkey);
-      await _writeReg(_rtcCntlWdtConfig0Reg, 0);
-      await _writeReg(_rtcCntlWdtWprotectReg, 0);
+      await _writeReg(regs.wdtWprotectReg, _rtcWdtWkey);
+      await _writeReg(regs.wdtConfig0Reg, 0);
+      await _writeReg(regs.wdtWprotectReg, 0);
       _d('RTC WDT disabled');
 
       // Enable SWD auto-feed so the Super WDT never expires:
       //   1. Unlock SWD write-protect register.
       //   2. Set SWD_AUTO_FEED_EN bit in SWD_CONF.
       //   3. Re-lock.
-      await _writeReg(_rtcCntlSwdWprotectReg, _rtcCntlSwdWkey);
-      final swdConf = await _readReg(_rtcCntlSwdConfReg);
-      await _writeReg(_rtcCntlSwdConfReg, swdConf | _rtcCntlSwdAutoFeedEn);
-      await _writeReg(_rtcCntlSwdWprotectReg, 0);
+      await _writeReg(regs.swdWprotectReg, regs.swdWkey);
+      final swdConf = await _readReg(regs.swdConfReg);
+      await _writeReg(regs.swdConfReg, swdConf | regs.swdAutoFeedEn);
+      await _writeReg(regs.swdWprotectReg, 0);
       _d('SWD auto-feed enabled');
     } catch (e) {
       // Non-fatal: if we can't disable watchdogs log a warning and proceed.
