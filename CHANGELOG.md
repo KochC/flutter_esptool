@@ -1,5 +1,9 @@
 ## Unreleased
 
+- ESP32-C6 flasher stub (esp-flasher-stub v0.7.0, MIT OR Apache-2.0), so
+  a C6 gets the stub chip erase (0xD0) instead of the slow ROM fallback.
+  Before the upload the C6's USB-Serial/JTAG watchdogs are disabled with its
+  own LP_WDT registers (the S3's RTC_CNTL addresses do not exist on a C6).
 - **Licensing fix:** the embedded ESP32-S3 flasher stub was esptool's legacy
   stub (GPL-2.0-or-later, from esptool 4.8.1 `stub_flasher/1/`) but was
   labelled MIT. It is replaced by Espressif's esp-flasher-stub v0.7.0

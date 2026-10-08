@@ -71,22 +71,137 @@ void main() {
       expect(service.isLoaded, isFalse);
     }, timeout: const Timeout(Duration(seconds: 20)));
 
-    test('watchdog disable runs when USB-JTAG is detected', () async {
-      // UARTDEV_BUF_NO read must return the USB-JTAG marker (3) so the WDT
-      // disable branch executes; all writes succeed; OHAI is provided.
+    // The exact USB-Serial/JTAG watchdog sequence per chip, as esptool's
+    // disable_watchdogs() (esptool/targets/esp32c3.py) issues it with each
+    // target's registers: RWDT unlock/disable/lock, then SWD unlock,
+    // read-modify-write of the auto-feed bit, lock.
+    for (final (
+          chip,
+          bufNo,
+          wdtCfg0,
+          wdtProt,
+          swdConf,
+          swdFeed,
+          swdProt,
+          swdKey
+        ) in [
+      (
+        ChipFamily.esp32s3,
+        0x3FCEF14C,
+        0x60008098,
+        0x600080B0,
+        0x600080B4,
+        1 << 31,
+        0x600080B8,
+        0x8F1D312A,
+      ),
+      (
+        ChipFamily.esp32c6,
+        0x4087F580,
+        0x600B1C00,
+        0x600B1C18,
+        0x600B1C1C,
+        1 << 18,
+        0x600B1C20,
+        0x50D83AA1,
+      ),
+    ]) {
+      test('$chip on USB-JTAG disables its own watchdog registers', () async {
+        const swdConfBefore = 0x00000123;
+        final transport = FakeTransport(
+          onCommand: (command) {
+            if (command.opcode == EspCommandOpcode.readReg) {
+              final addr = ByteData.sublistView(command.data)
+                  .getUint32(0, Endian.little);
+              if (addr == bufNo) return okResponse(command.opcode, value: 3);
+              if (addr == swdConf) {
+                return okResponse(command.opcode, value: swdConfBefore);
+              }
+              return okResponse(command.opcode, value: 0xBAD);
+            }
+            return okResponse(command.opcode);
+          },
+          readRawBytes: <int>[0x4F, 0x48, 0x41, 0x49],
+        );
+
+        final result =
+            await StubLoaderService(transport: transport).loadStub(chip);
+        expect(result.isSuccess, isTrue);
+
+        int field(EspCommand c, int at) =>
+            ByteData.sublistView(c.data).getUint32(at, Endian.little);
+        final regOps = transport.sentCommands
+            .where((c) =>
+                c.opcode == EspCommandOpcode.readReg ||
+                c.opcode == EspCommandOpcode.writeReg)
+            .map((c) => c.opcode == EspCommandOpcode.readReg
+                ? ('r', field(c, 0), null)
+                : ('w', field(c, 0), field(c, 4)))
+            .toList();
+        expect(regOps, [
+          ('r', bufNo, null),
+          ('w', wdtProt, 0x50D83AA1),
+          ('w', wdtCfg0, 0),
+          ('w', wdtProt, 0),
+          ('w', swdProt, swdKey),
+          ('r', swdConf, null),
+          ('w', swdConf, swdConfBefore | swdFeed),
+          ('w', swdProt, 0),
+        ]);
+        // All of it happens before the stub upload starts.
+        final firstBegin = transport.sentCommands
+            .indexWhere((c) => c.opcode == EspCommandOpcode.memBegin);
+        final lastReg = transport.sentCommands
+            .lastIndexWhere((c) => c.opcode == EspCommandOpcode.writeReg);
+        expect(lastReg, lessThan(firstBegin));
+      });
+    }
+
+    test('ESP32-C6 not on USB-JTAG: probes the port, writes no register',
+        () async {
       final transport = FakeTransport(
-        onCommand: (command) {
-          if (command.opcode == EspCommandOpcode.readReg) {
-            return okResponse(command.opcode, value: 3); // USB-JTAG/Serial
-          }
-          return okResponse(command.opcode);
-        },
+        onCommand: (command) => command.opcode == EspCommandOpcode.readReg
+            ? okResponse(command.opcode, value: 0) // UART0
+            : okResponse(command.opcode),
         readRawBytes: <int>[0x4F, 0x48, 0x41, 0x49],
+      );
+      final result = await StubLoaderService(transport: transport)
+          .loadStub(ChipFamily.esp32c6);
+      expect(result.isSuccess, isTrue);
+      final ops = transport.sentCommands.map((c) => c.opcode).toList();
+      expect(ops.where((o) => o == EspCommandOpcode.readReg), hasLength(1));
+      expect(ops, isNot(contains(EspCommandOpcode.writeReg)));
+    });
+
+    test(
+        'ESP32-C6: uploads its own stub in 0x1800 blocks at its RAM '
+        'addresses and jumps to the C6 entry', () async {
+      final transport = FakeTransport(
+        readRawBytes: <int>[0xC0, 0x4F, 0x48, 0x41, 0x49, 0xC0],
       );
       final service = StubLoaderService(transport: transport);
 
-      final result = await service.loadStub(ChipFamily.esp32s3);
+      final result = await service.loadStub(ChipFamily.esp32c6);
       expect(result.isSuccess, isTrue);
+      expect(service.isLoaded, isTrue);
+
+      final begins = transport.sentCommands
+          .where((c) => c.opcode == EspCommandOpcode.memBegin)
+          .map((c) => ByteData.sublistView(c.data))
+          .toList();
+      expect(begins, hasLength(2)); // text + data
+      for (final b in begins) {
+        expect(b.getUint32(8, Endian.little), 0x1800); // block size
+      }
+      expect(begins[0].getUint32(0, Endian.little), 6404);
+      expect(begins[0].getUint32(12, Endian.little), 0x40800000);
+      expect(begins[1].getUint32(0, Endian.little), 192);
+      expect(begins[1].getUint32(12, Endian.little), 0x40852D64);
+      final end = ByteData.sublistView(transport.sentCommands
+          .lastWhere((c) => c.opcode == EspCommandOpcode.memEnd)
+          .data);
+      expect(end.getUint32(0, Endian.little), 0); // 0 = jump to entry
+      expect(end.getUint32(4, Endian.little), 0x40800000);
     });
 
     test('surfaces a MEM_BEGIN failure during upload', () async {
@@ -163,6 +278,12 @@ void main() {
         'f038186b9984b8767654ef1bd8da8d1b9db939762f2cb07a5854dcf0c1f8909f',
         'a8897efc120fd1c7e74f439c3b8aea3488c84995c0ca2c514c2a5c25c78b6c9d',
         0x4002800C,
+      ),
+      (
+        ChipFamily.esp32c6,
+        '2026ea3d4f65af9017e1da5341698d077f7b9a2e1837c286b5cba6d300dbcfcf',
+        'aa0d4f8be6244247f807ac329c05478fa0599bf18b680cb6609faf43aa009667',
+        0x40800000,
       ),
     ]) {
       test('$chip uploads the pinned esp-flasher-stub v0.7.0 binary', () async {
