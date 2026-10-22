@@ -153,9 +153,11 @@ void main() {
       expect((await service.lockFlashEncryptionKey()).isFailure, isTrue);
     });
 
-    test('readSecureBootKeyDigest reconstructs 32 bytes from 8 words', () async {
+    test('readSecureBootKeyDigest reconstructs 32 bytes from 8 words',
+        () async {
       // 8 words, each 0x03020100 + i pattern → predictable little-endian bytes.
-      final words = List<int>.generate(8, (i) => 0x04030201 * (i + 1) & 0xFFFFFFFF);
+      final words =
+          List<int>.generate(8, (i) => 0x04030201 * (i + 1) & 0xFFFFFFFF);
       final transport = FakeTransport(readRegValues: words);
       final service = EfuseService(transport: transport);
 
@@ -176,7 +178,8 @@ void main() {
 
     test('readFlashEncryptionKey returns 32 bytes', () async {
       final service = EfuseService(
-        transport: FakeTransport(readRegValues: List<int>.filled(8, 0xDEADBEEF)),
+        transport:
+            FakeTransport(readRegValues: List<int>.filled(8, 0xDEADBEEF)),
       );
       final result = await service.readFlashEncryptionKey();
       expect((result as Success<Uint8List>).value.length, 32);
@@ -205,7 +208,8 @@ void main() {
           //   then w0,w1,w2,w3.
           // Return 0 for idle polls; shape the last 4 as provisioning words.
           // Simplest: encode via value based on the register address.
-          final addr = ByteData.sublistView(command.data).getUint32(0, Endian.little);
+          final addr =
+              ByteData.sublistView(command.data).getUint32(0, Endian.little);
           const rdBlock0Base = 0x60007000 + 0x02C;
           if (addr == rdBlock0Base) {
             return okResponse(command.opcode, value: (1 << 23) | (1 << 8));
@@ -216,6 +220,14 @@ void main() {
                 value: (4 << 24) | (9 << 28) | (1 << 18));
           } else if (addr == rdBlock0Base + 12) {
             return okResponse(command.opcode, value: 1 << 20);
+          }
+          // BLOCK_KEY1 (the digest block): word i = 0x11111111 * (i + 1).
+          const rdKey1Base = 0x60007000 + 0x09C + 0x20;
+          if (addr >= rdKey1Base && addr < rdKey1Base + 32) {
+            return okResponse(
+              command.opcode,
+              value: 0x11111111 * ((addr - rdKey1Base) ~/ 4 + 1),
+            );
           }
           return okResponse(command.opcode); // idle poll = 0
         },
@@ -236,6 +248,35 @@ void main() {
       expect(state.flashEncryptionActive, isTrue); // cryptCnt=1 → odd
       expect(readCount, greaterThan(4));
       expect(state.toString(), contains('keyPurpose0=4'));
+      // All six purposes and the one digest (BLOCK_KEY1), never BLOCK_KEY0.
+      expect(state.keyPurposes, [4, 9, 0, 0, 0, 0]);
+      expect(state.secureBootDigests, hasLength(1));
+      expect(
+        ByteData.sublistView(state.secureBootDigests!.single)
+            .getUint32(0, Endian.little),
+        0x11111111,
+      );
+    });
+
+    test('key purposes and digest blocks decode the ESP32-S3 layout', () {
+      expect(
+        EfuseService.decodeKeyPurposes(
+          (4 << 24) | (9 << 28),
+          10 | (11 << 4) | (2 << 8) | (3 << 12),
+        ),
+        [4, 9, 10, 11, 2, 3],
+      );
+      final purposes = [4, 9, 10, 11, 0, 0];
+      expect(EfuseService.secureBootDigestBlocks(purposes, 0, 0), [1, 2, 3]);
+      // SECURE_BOOT_KEY_REVOKE1 (bit 22) drops the DIGEST1 slot (block 2).
+      expect(
+        EfuseService.secureBootDigestBlocks(purposes, 1 << 22, 0),
+        [1, 3],
+      );
+      // A read-protected block is never read.
+      expect(EfuseService.secureBootDigestBlocks(purposes, 0, 1 << 3), [1, 2]);
+      expect(EfuseService.secureBootDigestBlocks([4, 0, 0, 0, 0, 0], 0, 0),
+          isEmpty);
     });
 
     test('readProvisioningState reports a read failure', () async {
@@ -251,7 +292,8 @@ void main() {
       final transport = FakeTransport(
         onCommand: (command) {
           if (command.opcode == EspCommandOpcode.readReg) {
-            return okResponse(command.opcode, value: 0x2); // PGM pending forever
+            return okResponse(command.opcode,
+                value: 0x2); // PGM pending forever
           }
           return okResponse(command.opcode);
         },
