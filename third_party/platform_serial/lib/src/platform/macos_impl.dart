@@ -4,6 +4,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:ffi' as ffi;
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
@@ -19,6 +20,18 @@ void _dm(String msg) {
 class MacOSSerialImpl {
   static _MacOSSerialBindings? _cachedBindings;
   static final Map<String, _MacOSPortState> _ports = {};
+
+  /// Ports whose native open is still running (possibly abandoned after
+  /// [openTimeout]).
+  static final Set<String> _opening = {};
+
+  /// How long opening a port may take. A device whose USB stack stopped
+  /// answering control requests (e.g. firmware that acknowledged a reboot
+  /// but hung) makes the macOS driver block `open()`, the line setup and
+  /// the baud-rate ioctl for up to a minute each. The native open therefore
+  /// runs on a background isolate, so the calling (UI) isolate never blocks,
+  /// and is abandoned after this time; a handle it returns later is closed.
+  static Duration openTimeout = const Duration(seconds: 5);
 
   static _MacOSSerialBindings get _bindings {
     if (!Platform.isMacOS) {
@@ -84,9 +97,90 @@ class MacOSSerialImpl {
       );
     }
 
+    if (_opening.contains(portName)) {
+      throw SerialError(
+        type: SerialErrorType.timeout,
+        message:
+            'Port $portName is still being opened by an earlier attempt '
+            'that did not return: the device is not answering USB requests',
+      );
+    }
+
+    _opening.add(portName);
+    final pending = Isolate.run(
+      () => _openNative(
+        portName,
+        baudRate,
+        dataBits,
+        stopBits,
+        parity,
+        flowControl,
+        readTimeout,
+        writeTimeout,
+      ),
+    );
+    final _NativeOpen result;
+    try {
+      result = await pending.timeout(openTimeout);
+    } on TimeoutException {
+      _dm(
+        '[macOS] open($portName) did not return within '
+        '${openTimeout.inSeconds} s — abandoned',
+      );
+      unawaited(
+        pending
+            .then((late) {
+              if (late.handle != 0) _bindings.closePort(late.handle);
+            })
+            .catchError((Object _) {})
+            .whenComplete(() => _opening.remove(portName)),
+      );
+      throw SerialError(
+        type: SerialErrorType.timeout,
+        message:
+            'Opening $portName took longer than '
+            '${openTimeout.inSeconds} s: the device is not answering USB '
+            'requests. Unplug it and plug it in again.',
+      );
+    } catch (_) {
+      _opening.remove(portName);
+      rethrow;
+    }
+    _opening.remove(portName);
+
+    if (result.handle == 0) {
+      throw SerialError(
+        type: _mapErrorCode(result.errorCode),
+        message: result.errorMessage == null || result.errorMessage!.isEmpty
+            ? 'Error opening port on macOS'
+            : 'Error opening port on macOS: ${result.errorMessage}',
+      );
+    }
+
+    _ports[portName] = _MacOSPortState(
+      portName: portName,
+      handle: result.handle,
+      readTimeoutMs: readTimeout,
+      writeTimeoutMs: writeTimeout,
+    );
+  }
+
+  /// The blocking native open, run on a background isolate. The native error
+  /// is thread-local, so it is read here, on the same thread.
+  static _NativeOpen _openNative(
+    String portName,
+    int baudRate,
+    int dataBits,
+    int stopBits,
+    int parity,
+    int flowControl,
+    int readTimeout,
+    int writeTimeout,
+  ) {
+    final bindings = _MacOSSerialBindings.open();
     final portNamePointer = portName.toNativeUtf8();
     try {
-      final handle = _bindings.openPort(
+      final handle = bindings.openPort(
         portNamePointer,
         baudRate,
         dataBits,
@@ -96,16 +190,15 @@ class MacOSSerialImpl {
         readTimeout,
         writeTimeout,
       );
-      if (handle == 0) {
-        throw _lastError('Error opening port on macOS');
+      if (handle != 0) return _NativeOpen(handle, 0, null);
+      final code = bindings.getLastErrorCode();
+      final messagePointer = bindings.copyLastErrorMessage();
+      String? message;
+      if (messagePointer != ffi.nullptr) {
+        message = messagePointer.toDartString();
+        bindings.freeMemory(messagePointer.cast());
       }
-
-      _ports[portName] = _MacOSPortState(
-        portName: portName,
-        handle: handle,
-        readTimeoutMs: readTimeout,
-        writeTimeoutMs: writeTimeout,
-      );
+      return _NativeOpen(0, code, message);
     } finally {
       calloc.free(portNamePointer);
     }
@@ -149,7 +242,8 @@ class MacOSSerialImpl {
     if (length <= 0) return Uint8List(0);
 
     final handle = state.handle;
-    final deadlineMs = DateTime.now().millisecondsSinceEpoch +
+    final deadlineMs =
+        DateTime.now().millisecondsSinceEpoch +
         (timeoutMs ?? state.readTimeoutMs);
 
     while (true) {
@@ -194,8 +288,12 @@ class MacOSSerialImpl {
           final readLength = avail;
           final buffer = calloc<ffi.Uint8>(readLength);
           try {
-            final bytesRead =
-                _bindings.read(handle, buffer, readLength, nativeTimeoutMs);
+            final bytesRead = _bindings.read(
+              handle,
+              buffer,
+              readLength,
+              nativeTimeoutMs,
+            );
             if (bytesRead < 0) {
               // EAGAIN/EWOULDBLOCK: FIONREAD reported bytes but they were
               // consumed before this read (or the buffer briefly emptied).
@@ -231,7 +329,9 @@ class MacOSSerialImpl {
 
         if (collected.length > 0) {
           final result = collected.toBytes();
-          _dm('[MAC] native drained: ${result.length} bytes (FIONREAD start=$available)');
+          _dm(
+            '[MAC] native drained: ${result.length} bytes (FIONREAD start=$available)',
+          );
           return result;
         }
         // Native read timed out — yield and retry within the outer deadline.
@@ -286,9 +386,7 @@ class MacOSSerialImpl {
         // kernel output buffer is not ready, or writes as many bytes as fit.
         final bytesWritten = _bindings.write(
           handle,
-          ffi.Pointer<ffi.Uint8>.fromAddress(
-            pointer.address + totalWritten,
-          ),
+          ffi.Pointer<ffi.Uint8>.fromAddress(pointer.address + totalWritten),
           data.length - totalWritten,
           0, // timeout=0 → non-blocking
         );
@@ -437,31 +535,34 @@ class MacOSSerialImpl {
   }
 }
 
-typedef _GetAvailablePortsJsonNative = ffi.Int32 Function(
-    ffi.Pointer<ffi.Pointer<Utf8>>);
-typedef _OpenPortNative = ffi.IntPtr Function(
-  ffi.Pointer<Utf8>,
-  ffi.Int32,
-  ffi.Int32,
-  ffi.Int32,
-  ffi.Int32,
-  ffi.Int32,
-  ffi.Int32,
-  ffi.Int32,
-);
+typedef _GetAvailablePortsJsonNative =
+    ffi.Int32 Function(ffi.Pointer<ffi.Pointer<Utf8>>);
+typedef _OpenPortNative =
+    ffi.IntPtr Function(
+      ffi.Pointer<Utf8>,
+      ffi.Int32,
+      ffi.Int32,
+      ffi.Int32,
+      ffi.Int32,
+      ffi.Int32,
+      ffi.Int32,
+      ffi.Int32,
+    );
 typedef _ClosePortNative = ffi.Int32 Function(ffi.IntPtr);
-typedef _ReadNative = ffi.Int32 Function(
-  ffi.IntPtr,
-  ffi.Pointer<ffi.Uint8>,
-  ffi.Int32,
-  ffi.Int32,
-);
-typedef _WriteNative = ffi.Int32 Function(
-  ffi.IntPtr,
-  ffi.Pointer<ffi.Uint8>,
-  ffi.Int32,
-  ffi.Int32,
-);
+typedef _ReadNative =
+    ffi.Int32 Function(
+      ffi.IntPtr,
+      ffi.Pointer<ffi.Uint8>,
+      ffi.Int32,
+      ffi.Int32,
+    );
+typedef _WriteNative =
+    ffi.Int32 Function(
+      ffi.IntPtr,
+      ffi.Pointer<ffi.Uint8>,
+      ffi.Int32,
+      ffi.Int32,
+    );
 typedef _HandleOnlyNative = ffi.Int32 Function(ffi.IntPtr);
 typedef _WaitReadableNative = ffi.Int32 Function(ffi.IntPtr, ffi.Int32);
 typedef _SetControlSignalNative = ffi.Int32 Function(ffi.IntPtr, ffi.Int32);
@@ -472,55 +573,70 @@ typedef _FreeMemoryNative = ffi.Void Function(ffi.Pointer<ffi.Void>);
 /// Lazy wrapper for the native functions exposed by the macOS pod.
 class _MacOSSerialBindings {
   _MacOSSerialBindings._(ffi.DynamicLibrary library)
-      : getAvailablePortsJson = library.lookupFunction<
-                _GetAvailablePortsJsonNative,
-                int Function(ffi.Pointer<ffi.Pointer<Utf8>>)>(
-            'serial_get_available_ports_json'),
-        openPort = library.lookupFunction<
+    : getAvailablePortsJson = library
+          .lookupFunction<
+            _GetAvailablePortsJsonNative,
+            int Function(ffi.Pointer<ffi.Pointer<Utf8>>)
+          >('serial_get_available_ports_json'),
+      openPort = library
+          .lookupFunction<
             _OpenPortNative,
-            int Function(ffi.Pointer<Utf8>, int, int, int, int, int, int,
-                int)>('serial_open_port'),
-        closePort = library.lookupFunction<_ClosePortNative, int Function(int)>(
-          'serial_close_port',
-        ),
-        read = library.lookupFunction<_ReadNative,
-            int Function(int, ffi.Pointer<ffi.Uint8>, int, int)>('serial_read'),
-        write = library.lookupFunction<
+            int Function(ffi.Pointer<Utf8>, int, int, int, int, int, int, int)
+          >('serial_open_port'),
+      closePort = library.lookupFunction<_ClosePortNative, int Function(int)>(
+        'serial_close_port',
+      ),
+      read = library
+          .lookupFunction<
+            _ReadNative,
+            int Function(int, ffi.Pointer<ffi.Uint8>, int, int)
+          >('serial_read'),
+      write = library
+          .lookupFunction<
             _WriteNative,
-            int Function(
-                int, ffi.Pointer<ffi.Uint8>, int, int)>('serial_write'),
-        bytesAvailable =
-            library.lookupFunction<_HandleOnlyNative, int Function(int)>(
-          'serial_bytes_available',
-        ),
-        waitReadable =
-            library.lookupFunction<_WaitReadableNative, int Function(int, int)>(
-          'serial_wait_readable',
-        ),
-        setDtr = library.lookupFunction<_SetControlSignalNative,
-            int Function(int, int)>('serial_set_dtr'),
-        setRts = library.lookupFunction<_SetControlSignalNative,
-            int Function(int, int)>('serial_set_rts'),
-        flush = library.lookupFunction<_HandleOnlyNative, int Function(int)>(
-          'serial_flush',
-        ),
-        resetBuffers =
-            library.lookupFunction<_HandleOnlyNative, int Function(int)>(
-          'serial_reset_buffers',
-        ),
-        getLastErrorCode =
-            library.lookupFunction<_GetLastErrorCodeNative, int Function()>(
-          'serial_get_last_error_code',
-        ),
-        copyLastErrorMessage = library.lookupFunction<
+            int Function(int, ffi.Pointer<ffi.Uint8>, int, int)
+          >('serial_write'),
+      bytesAvailable = library
+          .lookupFunction<_HandleOnlyNative, int Function(int)>(
+            'serial_bytes_available',
+          ),
+      waitReadable = library
+          .lookupFunction<_WaitReadableNative, int Function(int, int)>(
+            'serial_wait_readable',
+          ),
+      setDtr = library
+          .lookupFunction<_SetControlSignalNative, int Function(int, int)>(
+            'serial_set_dtr',
+          ),
+      setRts = library
+          .lookupFunction<_SetControlSignalNative, int Function(int, int)>(
+            'serial_set_rts',
+          ),
+      flush = library.lookupFunction<_HandleOnlyNative, int Function(int)>(
+        'serial_flush',
+      ),
+      resetBuffers = library
+          .lookupFunction<_HandleOnlyNative, int Function(int)>(
+            'serial_reset_buffers',
+          ),
+      getLastErrorCode = library
+          .lookupFunction<_GetLastErrorCodeNative, int Function()>(
+            'serial_get_last_error_code',
+          ),
+      copyLastErrorMessage = library
+          .lookupFunction<
             _CopyLastErrorMessageNative,
-            ffi.Pointer<Utf8> Function()>('serial_copy_last_error_message'),
-        freeMemory = library.lookupFunction<_FreeMemoryNative,
-            void Function(ffi.Pointer<ffi.Void>)>('serial_free_memory');
+            ffi.Pointer<Utf8> Function()
+          >('serial_copy_last_error_message'),
+      freeMemory = library
+          .lookupFunction<
+            _FreeMemoryNative,
+            void Function(ffi.Pointer<ffi.Void>)
+          >('serial_free_memory');
 
   final int Function(ffi.Pointer<ffi.Pointer<Utf8>>) getAvailablePortsJson;
   final int Function(ffi.Pointer<Utf8>, int, int, int, int, int, int, int)
-      openPort;
+  openPort;
   final int Function(int) closePort;
   final int Function(int, ffi.Pointer<ffi.Uint8>, int, int) read;
   final int Function(int, ffi.Pointer<ffi.Uint8>, int, int) write;
@@ -536,6 +652,14 @@ class _MacOSSerialBindings {
 
   static _MacOSSerialBindings open() =>
       _MacOSSerialBindings._(ffi.DynamicLibrary.process());
+}
+
+/// Result of [MacOSSerialImpl._openNative]: a handle, or 0 with the error.
+class _NativeOpen {
+  const _NativeOpen(this.handle, this.errorCode, this.errorMessage);
+  final int handle;
+  final int errorCode;
+  final String? errorMessage;
 }
 
 class _MacOSPortState {

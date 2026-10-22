@@ -298,9 +298,44 @@ class EfuseService {
   // ---------------------------------------------------------------------------
 
   /// BLOCK0 read-register base (RD_WR_DIS_REG). word0=WR_DIS, word1=RD_DIS,
-  /// word2={SPI_BOOT_CRYPT_CNT@18, KEY_PURPOSE_0@24, KEY_PURPOSE_1@28},
-  /// word3={SECURE_BOOT_EN@20}.
+  /// word2={SPI_BOOT_CRYPT_CNT@18, SECURE_BOOT_KEY_REVOKE0..2@21..23,
+  /// KEY_PURPOSE_0@24, KEY_PURPOSE_1@28},
+  /// word3={KEY_PURPOSE_2@0, _3@4, _4@8, _5@12, SECURE_BOOT_EN@20}
+  /// (ESP32-S3 eFuse table: BLOCK0 bits 82, 85–87, 88–111, 116).
   static const int _rdBlock0Base = _base + 0x02C;
+
+  /// Read registers of BLOCK_KEY0 (BLOCK4); BLOCK_KEYn is 0x20 further.
+  static const int _rdKey0Base = _base + 0x09C;
+
+  /// KEY_PURPOSE_0..5 from BLOCK0 words 2 and 3. Pure.
+  static List<int> decodeKeyPurposes(int word2, int word3) => [
+        (word2 >> 24) & 0xF,
+        (word2 >> 28) & 0xF,
+        word3 & 0xF,
+        (word3 >> 4) & 0xF,
+        (word3 >> 8) & 0xF,
+        (word3 >> 12) & 0xF,
+      ];
+
+  /// The key blocks (0–5) holding a Secure Boot digest that counts: purpose
+  /// SECURE_BOOT_DIGEST0..2 (9–11), the digest slot not revoked
+  /// (SECURE_BOOT_KEY_REVOKEn, bits 21–23 of [word2]) and the block not
+  /// read-protected. Pure.
+  static List<int> secureBootDigestBlocks(
+    List<int> keyPurposes,
+    int word2,
+    int rdDis,
+  ) =>
+      [
+        for (var i = 0; i < keyPurposes.length; i++)
+          if (keyPurposes[i] >= keyPurposeSecureBootDigest0 &&
+              keyPurposes[i] <= keyPurposeSecureBootDigest0 + 2 &&
+              (word2 >> (21 + keyPurposes[i] - keyPurposeSecureBootDigest0)) &
+                      1 ==
+                  0 &&
+              (rdDis >> i) & 1 == 0)
+            i,
+      ];
 
   /// Reads the provisioning-relevant BLOCK0 eFuse state so a caller can tell
   /// which secure-provisioning steps have already been completed and skip them
@@ -313,14 +348,32 @@ class EfuseService {
       final w1 = await _readReg(_rdBlock0Base + 4); // RD_DIS
       final w2 = await _readReg(_rdBlock0Base + 8); // crypt_cnt + key purposes
       final w3 = await _readReg(_rdBlock0Base + 12); // SECURE_BOOT_EN
+      final purposes = decodeKeyPurposes(w2, w3);
+      // The Secure Boot digests (public-key hashes, never key material) for
+      // the Factory's key check; flash-encryption key blocks are not read.
+      final digests = <Uint8List>[];
+      for (final block in secureBootDigestBlocks(purposes, w2, w1 & 0x7F)) {
+        final out = Uint8List(32);
+        final bd = ByteData.sublistView(out);
+        for (var i = 0; i < 8; i++) {
+          bd.setUint32(
+            i * 4,
+            await _readReg(_rdKey0Base + block * 0x20 + i * 4),
+            Endian.little,
+          );
+        }
+        digests.add(out);
+      }
       return Success<EfuseProvisioningState>(
         EfuseProvisioningState(
           wrDis: w0,
           rdDis: w1 & 0x7F,
-          keyPurpose0: (w2 >> 24) & 0xF,
-          keyPurpose1: (w2 >> 28) & 0xF,
+          keyPurpose0: purposes[0],
+          keyPurpose1: purposes[1],
           spiBootCryptCnt: (w2 >> 18) & 0x7,
           secureBootEn: ((w3 >> 20) & 1) == 1,
+          keyPurposes: purposes,
+          secureBootDigests: digests,
         ),
       );
     } catch (error, stackTrace) {
@@ -451,7 +504,16 @@ class EfuseProvisioningState {
     required this.keyPurpose1,
     required this.spiBootCryptCnt,
     required this.secureBootEn,
+    this.keyPurposes,
+    this.secureBootDigests,
   });
+
+  /// KEY_PURPOSE_0..5 (null = not read).
+  final List<int>? keyPurposes;
+
+  /// The 32-byte Secure Boot V2 digests of every non-revoked digest slot
+  /// (null = not read; empty = read, none burned).
+  final List<Uint8List>? secureBootDigests;
 
   /// Raw WR_DIS bitmask (BLOCK0 word0).
   final int wrDis;
